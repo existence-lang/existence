@@ -1,6 +1,6 @@
 [package]
 name = "existence"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "CLI for the Existence ontology framework"
 license = "Apache-2.0"
