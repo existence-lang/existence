@@ -57,9 +57,7 @@ pub fn run(
     println!("Created {}", file_path.display());
 
     // Open in $EDITOR if set and --no-edit not specified
-    if !no_edit
-        && let Ok(editor) = std::env::var("EDITOR")
-    {
+    if !no_edit && let Ok(editor) = std::env::var("EDITOR") {
         let status = std::process::Command::new(&editor)
             .arg(&file_path)
             .status()
@@ -158,11 +156,9 @@ fn insert_term_in_toml(raw: &str, ring_level: u32, term: &str) -> Result<String,
                 let after_bracket = &lines[i][closing..];
                 // Check if the array is empty
                 if before_bracket.trim().ends_with('[') {
-                    result.push(format!("{}\"{}\"{}",
-                        before_bracket, term, after_bracket));
+                    result.push(format!("{}\"{}\"{}", before_bracket, term, after_bracket));
                 } else {
-                    result.push(format!("{}, \"{}\"{}",
-                        before_bracket, term, after_bracket));
+                    result.push(format!("{}, \"{}\"{}", before_bracket, term, after_bracket));
                 }
                 term_inserted = true;
             } else {
@@ -396,10 +392,7 @@ description = "core"
 terms = []
 "#;
         let updated = insert_term_in_toml(toml, 0, "focus").unwrap();
-        assert!(
-            updated.contains(r#"terms = ["focus"]"#),
-            "Got: {updated}"
-        );
+        assert!(updated.contains(r#"terms = ["focus"]"#), "Got: {updated}");
     }
 
     #[test]

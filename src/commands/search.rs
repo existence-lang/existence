@@ -24,12 +24,7 @@ const WEIGHT_BODY: u32 = 10;
 /// 1. Term name — exact or substring match on filename (highest weight)
 /// 2. Definition — first paragraph under `## [Ontology]` header
 /// 3. Full content — any match in the full file body (lowest weight)
-pub fn run(
-    ontology_dir: &Path,
-    query: &str,
-    json: bool,
-    limit: usize,
-) -> Result<(), String> {
+pub fn run(ontology_dir: &Path, query: &str, json: bool, limit: usize) -> Result<(), String> {
     let results = search(ontology_dir, query, limit)?;
 
     if results.is_empty() {
@@ -59,11 +54,7 @@ pub fn run(
 }
 
 /// Core search logic, separated for testability.
-pub fn search(
-    ontology_dir: &Path,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>, String> {
+pub fn search(ontology_dir: &Path, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
     let src_dir = ontology_dir.join("src");
     if !src_dir.is_dir() {
         return Err(format!(

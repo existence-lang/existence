@@ -17,7 +17,8 @@ pub fn run(ontology_dir: &Path, source: Option<&str>) -> Result<(), String> {
                 let config = Config::load(&config_path)?;
                 if config.sources.is_empty() {
                     return Err(
-                        "No source specified and no [sources] section in existence.toml".to_string(),
+                        "No source specified and no [sources] section in existence.toml"
+                            .to_string(),
                     );
                 }
                 config.sources.into_iter().collect()
