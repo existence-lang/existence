@@ -5,16 +5,35 @@ use std::path::Path;
 struct LintResult {
     file: String,
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
+
+/// Findings for one node: errors fail the run, warnings are advisory.
+#[derive(Default)]
+struct LintFindings {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// The recognized Epistemology subsection vocabulary, as (kernel spelling, plain spelling)
+/// pairs. Subsection headings are non-normative per SPEC.md, so anything outside this set
+/// is a warning, not an error.
+const EPISTEMOLOGY_SUBSECTIONS: [(&str, &str); 2] = [
+    ("Cultural Definition", "Sources"),
+    ("Pattern Expression", "Examples"),
+];
 
 /// Validate ontology nodes against SPEC.md rules.
 ///
-/// Checks:
+/// Errors:
 /// - Title (# Term) is required
 /// - Ontology section is required
 /// - Axiology section is required
 /// - Epistemology section is required
 /// - Broken links: references to `./term.md` where `src/term.md` doesn't exist
+///
+/// Warnings:
+/// - Epistemology `###` subsections outside the recognized vocabulary
 pub fn run(ontology_dir: &Path, path: Option<&str>) -> Result<(), String> {
     let src_dir = match path {
         Some(p) => {
@@ -58,29 +77,46 @@ pub fn run(ontology_dir: &Path, path: Option<&str>) -> Result<(), String> {
             .unwrap_or("unknown")
             .to_string();
 
-        let errors = lint_content(&content, &filename, &existing_terms);
-        if !errors.is_empty() {
+        let findings = lint_content(&content, &filename, &existing_terms);
+        if !findings.errors.is_empty() || !findings.warnings.is_empty() {
             results.push(LintResult {
                 file: filename,
-                errors,
+                errors: findings.errors,
+                warnings: findings.warnings,
             });
         }
     }
 
-    if results.is_empty() {
-        println!("All nodes pass lint checks.");
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
+    let mut failing_files = 0;
+    for result in &results {
+        println!("{}:", result.file);
+        for err in &result.errors {
+            println!("  - {err}");
+            total_errors += 1;
+        }
+        for warning in &result.warnings {
+            println!("  - warn: {warning}");
+            total_warnings += 1;
+        }
+        if !result.errors.is_empty() {
+            failing_files += 1;
+        }
+        println!();
+    }
+
+    if total_errors == 0 {
+        if total_warnings == 0 {
+            println!("All nodes pass lint checks.");
+        } else {
+            println!("All nodes pass lint checks ({total_warnings} warning(s)).");
+        }
         Ok(())
     } else {
-        let mut total_errors = 0;
-        for result in &results {
-            println!("{}:", result.file);
-            for err in &result.errors {
-                println!("  - {err}");
-                total_errors += 1;
-            }
-            println!();
-        }
-        println!("{total_errors} error(s) in {} file(s).", results.len());
+        println!(
+            "{total_errors} error(s) in {failing_files} file(s), {total_warnings} warning(s)."
+        );
         // Return Err so the process exits with code 1
         Err(format!("{total_errors} lint error(s) found"))
     }
@@ -102,20 +138,81 @@ fn lint_single_file(path: &Path, ontology_dir: &Path) -> Result<(), String> {
         .unwrap_or("unknown")
         .to_string();
 
-    let errors = lint_content(&content, &filename, &existing_terms);
-    if errors.is_empty() {
+    let findings = lint_content(&content, &filename, &existing_terms);
+    if findings.errors.is_empty() && findings.warnings.is_empty() {
         println!("{filename}: OK");
+        return Ok(());
+    }
+    println!("{filename}:");
+    for err in &findings.errors {
+        println!("  - {err}");
+    }
+    for warning in &findings.warnings {
+        println!("  - warn: {warning}");
+    }
+    if findings.errors.is_empty() {
         Ok(())
     } else {
-        println!("{filename}:");
-        for err in &errors {
-            println!("  - {err}");
-        }
-        Err(format!("{} lint error(s) found", errors.len()))
+        Err(format!("{} lint error(s) found", findings.errors.len()))
     }
 }
 
-fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> Vec<String> {
+/// Reduce a heading line to comparable text: strip the `###` marker, markdown
+/// links (`[Pattern](./pattern.md) Expression` -> `Pattern Expression`), and
+/// surrounding whitespace.
+fn normalize_heading(line: &str) -> String {
+    let text = line.trim().trim_start_matches('#').trim();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some(close_rel) = rest[open..].find("](") else {
+            break;
+        };
+        let close = open + close_rel;
+        let Some(end_rel) = rest[close..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..close]);
+        rest = &rest[close + end_rel + 1..];
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Warn on `###` headings under `## Epistemology` that fall outside the recognized
+/// subsection vocabulary. Subsections are non-normative, so this never errors.
+fn check_epistemology_subsections(content: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut in_epistemology = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("## ") {
+            in_epistemology = t.contains("Epistemology");
+            continue;
+        }
+        if !in_epistemology || !t.starts_with("### ") {
+            continue;
+        }
+        let heading = normalize_heading(t);
+        let recognized = EPISTEMOLOGY_SUBSECTIONS
+            .iter()
+            .any(|(kernel, plain)| heading == *kernel || heading == *plain);
+        if !recognized {
+            let vocabulary = EPISTEMOLOGY_SUBSECTIONS
+                .iter()
+                .map(|(kernel, plain)| format!("{kernel} | {plain}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(format!(
+                "Non-standard Epistemology subsection `{heading}` — recognized vocabulary: {vocabulary}"
+            ));
+        }
+    }
+    warnings
+}
+
+fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> LintFindings {
     let mut errors = Vec::new();
 
     // Check title
@@ -154,7 +251,10 @@ fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> Vec
         }
     }
 
-    errors
+    LintFindings {
+        errors,
+        warnings: check_epistemology_subsections(content),
+    }
 }
 
 #[cfg(test)]
@@ -177,7 +277,7 @@ Value here.
 
 Knowledge here.
 "#;
-        let errors = lint_content(content, "test.md", &[]);
+        let errors = lint_content(content, "test.md", &[]).errors;
         // No structural errors (broken links are expected since no terms exist)
         let structural: Vec<_> = errors
             .iter()
@@ -189,7 +289,7 @@ Knowledge here.
     #[test]
     fn test_lint_missing_sections() {
         let content = "# Test\n\nSome content.\n";
-        let errors = lint_content(content, "test.md", &[]);
+        let errors = lint_content(content, "test.md", &[]).errors;
         assert!(errors.iter().any(|e| e.contains("Ontology")));
         assert!(errors.iter().any(|e| e.contains("Axiology")));
         assert!(errors.iter().any(|e| e.contains("Epistemology")));
@@ -198,8 +298,98 @@ Knowledge here.
     #[test]
     fn test_lint_missing_title() {
         let content = "## [Ontology](./ontology.md)\n## [Axiology](./axiology.md)\n## [Epistemology](./epistemology.md)\n";
-        let errors = lint_content(content, "test.md", &[]);
+        let errors = lint_content(content, "test.md", &[]).errors;
         assert!(errors.iter().any(|e| e.contains("Missing title")));
+    }
+
+    #[test]
+    fn test_recognized_subsections_both_spellings_no_warning() {
+        let content = r#"# Test
+
+## Ontology
+
+Definition.
+
+## Axiology
+
+Value.
+
+## Epistemology
+
+### [Cultural](./culture.md) Definition
+
+Quoted.
+
+### [Pattern](./pattern.md) Expression
+
+Shown.
+
+### Sources
+
+Quoted.
+
+### Examples
+
+Shown.
+"#;
+        let findings = lint_content(content, "test.md", &[]);
+        assert!(findings.warnings.is_empty(), "got: {:?}", findings.warnings);
+    }
+
+    #[test]
+    fn test_non_standard_subsection_warns_without_error() {
+        let content = r#"# Test
+
+## Ontology
+
+Definition.
+
+## Axiology
+
+Value.
+
+## Epistemology
+
+### Example
+
+A near miss.
+"#;
+        let findings = lint_content(content, "test.md", &[]);
+        assert!(findings.errors.is_empty(), "got: {:?}", findings.errors);
+        assert_eq!(findings.warnings.len(), 1);
+        assert!(findings.warnings[0].contains("`Example`"));
+        assert!(findings.warnings[0].contains("Pattern Expression | Examples"));
+    }
+
+    #[test]
+    fn test_subsections_outside_epistemology_are_ignored() {
+        let content = r#"# Test
+
+## Ontology
+
+### Anything Goes Here
+
+Definition.
+
+## Axiology
+
+Value.
+
+## Epistemology
+
+Knowledge.
+"#;
+        let findings = lint_content(content, "test.md", &[]);
+        assert!(findings.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_heading_strips_links() {
+        assert_eq!(
+            normalize_heading("### [Pattern](./pattern.md) Expression"),
+            "Pattern Expression"
+        );
+        assert_eq!(normalize_heading("###   Sources  "), "Sources");
     }
 
     #[test]
@@ -219,7 +409,7 @@ Value.
 Knowledge.
 "#;
         let existing = vec!["foo".to_string()];
-        let errors = lint_content(content, "test.md", &existing);
+        let errors = lint_content(content, "test.md", &existing).errors;
         // "bar" and "ontology" are broken, "foo" is OK
         assert!(errors.iter().any(|e| e.contains("bar")));
         assert!(!errors.iter().any(|e| e.contains("[foo]")));
