@@ -1,180 +1,110 @@
 #!/bin/sh
-# install.sh — existence installer
+# existence installer — downloads a prebuilt release binary for this machine.
 #
-# Downloads the latest prebuilt binaries from GitHub Releases and installs them
-# to ~/.cargo/bin/ (if it exists) or ~/.local/bin/ (created if needed).
-#
-# Supports: Linux (x86_64, aarch64), macOS (x86_64, aarch64)
-#
-# Usage:
 #   curl -fsSL https://raw.githubusercontent.com/existence-lang/existence/main/install.sh | sh
 #
-# Options (via environment variables):
-#   EXISTENCE_INSTALL_DIR  Override install directory (default: ~/.cargo/bin or ~/.local/bin)
-#   EXISTENCE_VERSION      Install a specific version (default: latest)
+# Environment:
+#   EXISTENCE_VERSION      release tag to install (default: latest release, e.g. v0.4.1)
+#   EXISTENCE_INSTALL_DIR  directory to install into
+#                          (default: $HOME/.cargo/bin if it exists, else $HOME/.local/bin)
+#   EXISTENCE_REPO         GitHub repo (default: existence-lang/existence)
+#
+# Supported: Linux (x86_64, aarch64; static musl builds), macOS (Intel, Apple
+# Silicon), and Windows under Git Bash / MSYS2 (x86_64). On native Windows use
+# install.ps1 instead.
 
 set -eu
 
-REPO="existence-lang/existence"
-GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
-GITHUB_DL="https://github.com/${REPO}/releases/download"
-
-# ---------------------------------------------------------------------------
-# Platform detection
-# ---------------------------------------------------------------------------
-
-detect_target() {
-  OS="$(uname -s)"
-  ARCH="$(uname -m)"
-
-  case "$OS" in
-    Linux)
-      case "$ARCH" in
-        x86_64 | amd64)  echo "x86_64-unknown-linux-gnu" ;;
-        aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
-        *) unsupported "$OS" "$ARCH" ;;
-      esac
-      ;;
-    Darwin)
-      case "$ARCH" in
-        x86_64 | amd64)  echo "x86_64-apple-darwin" ;;
-        aarch64 | arm64) echo "aarch64-apple-darwin" ;;
-        *) unsupported "$OS" "$ARCH" ;;
-      esac
-      ;;
-    *) unsupported "$OS" "$ARCH" ;;
-  esac
-}
-
-unsupported() {
-  echo "ERROR: Unsupported platform: $1 $2" >&2
-  echo "  See https://github.com/${REPO}/releases for manual download." >&2
-  exit 1
-}
-
-# ---------------------------------------------------------------------------
-# Install directory selection
-# ---------------------------------------------------------------------------
-
-select_install_dir() {
-  if [ -n "${EXISTENCE_INSTALL_DIR:-}" ]; then
-    echo "$EXISTENCE_INSTALL_DIR"
-  elif [ -d "${HOME}/.cargo/bin" ]; then
-    echo "${HOME}/.cargo/bin"
-  else
-    echo "${HOME}/.local/bin"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Dependency checks
-# ---------------------------------------------------------------------------
-
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "ERROR: Required command not found: $1" >&2
-    exit 1
-  fi
-}
-
-need_cmd curl
-need_cmd grep
-need_cmd sed
-need_cmd tar
-
-# ---------------------------------------------------------------------------
-# Resolve release tag
-# ---------------------------------------------------------------------------
-
-echo "Installing existence..."
-echo ""
-
-if [ -n "${EXISTENCE_VERSION:-}" ]; then
-  TAG="$EXISTENCE_VERSION"
-  echo "Requested version: ${TAG}"
+REPO="${EXISTENCE_REPO:-existence-lang/existence}"
+VERSION="${EXISTENCE_VERSION:-}"
+if [ -n "${EXISTENCE_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$EXISTENCE_INSTALL_DIR"
+elif [ -d "$HOME/.cargo/bin" ]; then
+  INSTALL_DIR="$HOME/.cargo/bin"
 else
-  echo "Fetching latest release..."
-  TAG="$(curl -s "${GITHUB_API}" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-
-  if [ -z "${TAG}" ]; then
-    echo "ERROR: Could not determine latest release tag." >&2
-    echo "  Check your internet connection or visit: https://github.com/${REPO}/releases" >&2
-    exit 1
-  fi
-  echo "Latest release: ${TAG}"
+  INSTALL_DIR="$HOME/.local/bin"
 fi
 
-# ---------------------------------------------------------------------------
-# Build download URL
-# Release assets: existence-{target}.tar.gz
-# ---------------------------------------------------------------------------
+say() { printf '%s\n' "existence-install: $*" >&2; }
+die() { say "error: $*"; exit 1; }
 
-TARGET="$(detect_target)"
-ARCHIVE_NAME="existence-${TARGET}.tar.gz"
-DOWNLOAD_URL="${GITHUB_DL}/${TAG}/${ARCHIVE_NAME}"
+need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
-echo "Target   : ${TARGET}"
-echo "Archive  : ${ARCHIVE_NAME}"
-
-# ---------------------------------------------------------------------------
-# Select and prepare install directory
-# ---------------------------------------------------------------------------
-
-INSTALL_DIR="$(select_install_dir)"
-
-if [ ! -d "${INSTALL_DIR}" ]; then
-  echo "Creating install directory: ${INSTALL_DIR}"
-  mkdir -p "${INSTALL_DIR}"
-fi
-
-# ---------------------------------------------------------------------------
-# Download and extract
-# ---------------------------------------------------------------------------
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-echo ""
-echo "Downloading ${DOWNLOAD_URL}..."
-curl -fSL --progress-bar "${DOWNLOAD_URL}" -o "${TMP_DIR}/${ARCHIVE_NAME}"
-
-echo "Extracting..."
-tar xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "${TMP_DIR}"
-
-# Move binaries to install directory
-mv "${TMP_DIR}/existence" "${INSTALL_DIR}/"
-mv "${TMP_DIR}/xist" "${INSTALL_DIR}/"
-chmod +x "${INSTALL_DIR}/existence" "${INSTALL_DIR}/xist"
-
-# ---------------------------------------------------------------------------
-# Verify installation
-# ---------------------------------------------------------------------------
-
-echo ""
-echo "Verifying installation..."
-if "${INSTALL_DIR}/existence" --version && "${INSTALL_DIR}/xist" --version; then
-  echo ""
-  echo "existence installed successfully to ${INSTALL_DIR}"
+# --- fetch helper: curl preferred, wget fallback ---------------------------
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL --retry 3 --retry-delay 1 "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -q "$1" -O "$2"; }
 else
-  echo "ERROR: Installed binaries failed to run." >&2
-  echo "  The downloaded binaries may not be compatible with this system." >&2
-  exit 1
+  die "need curl or wget"
 fi
 
-# ---------------------------------------------------------------------------
-# PATH guidance
-# ---------------------------------------------------------------------------
+# --- detect platform --------------------------------------------------------
+os="$(uname -s)"
+arch="$(uname -m)"
 
-case ":${PATH}:" in
-  *":${INSTALL_DIR}:"*)
-    ;;
-  *)
-    echo ""
-    echo "NOTE: ${INSTALL_DIR} is not in your PATH."
-    echo "      Add it with:"
-    echo ""
-    echo "        export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo ""
-    echo "      Add to ~/.bashrc or ~/.zshrc to make permanent."
-    ;;
+case "$arch" in
+  x86_64|amd64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) die "unsupported architecture: $arch" ;;
+esac
+
+ext=tar.gz
+case "$os" in
+  Linux)  target="${arch}-unknown-linux-musl" ;;
+  Darwin) target="${arch}-apple-darwin" ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    [ "$arch" = x86_64 ] || die "Windows builds are x86_64 only"
+    target="x86_64-pc-windows-msvc"; ext=zip ;;
+  *) die "unsupported OS: $os (use install.ps1 on native Windows)" ;;
+esac
+
+# --- resolve download URL ---------------------------------------------------
+# With no version, use the releases/latest/download redirect: it needs no API
+# call, so it is immune to the unauthenticated GitHub API rate limit that bites
+# shared CI runners.
+asset="existence-${target}.${ext}"
+if [ -z "$VERSION" ]; then
+  VERSION=latest
+  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+else
+  case "$VERSION" in v*) ;; *) VERSION="v${VERSION}" ;; esac
+  url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+fi
+
+# --- download + extract -----------------------------------------------------
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t existence)"
+trap 'rm -rf "$tmp"' EXIT
+
+say "downloading ${asset} (${VERSION})"
+fetch "$url" "$tmp/$asset" || die "download failed: $url"
+
+case "$ext" in
+  tar.gz) need tar; tar -xzf "$tmp/$asset" -C "$tmp" ;;
+  zip)
+    if command -v unzip >/dev/null 2>&1; then unzip -q "$tmp/$asset" -d "$tmp"
+    else need tar; tar -xf "$tmp/$asset" -C "$tmp"; fi ;;
+esac
+
+bin_suffix=""
+[ "$ext" = zip ] && bin_suffix=".exe"
+[ -f "$tmp/existence${bin_suffix}" ] || die "archive did not contain the existence binary"
+
+mkdir -p "$INSTALL_DIR"
+for b in existence xist; do
+  if [ -f "$tmp/${b}${bin_suffix}" ]; then
+    install -m 755 "$tmp/${b}${bin_suffix}" "$INSTALL_DIR/${b}${bin_suffix}" 2>/dev/null \
+      || { cp "$tmp/${b}${bin_suffix}" "$INSTALL_DIR/${b}${bin_suffix}" && chmod 755 "$INSTALL_DIR/${b}${bin_suffix}"; }
+  fi
+done
+
+# --- verify -----------------------------------------------------------------
+installed="$("$INSTALL_DIR/existence${bin_suffix}" --version 2>/dev/null || true)"
+[ -n "$installed" ] || die "installed binary failed to run: $INSTALL_DIR/existence${bin_suffix}"
+say "installed ${installed} -> ${INSTALL_DIR}"
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) say "note: ${INSTALL_DIR} is not on your PATH; add it, e.g.:"
+     say "  export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
 esac

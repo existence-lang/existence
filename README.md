@@ -6,11 +6,30 @@ Navigate, validate, and visualize ontology term definitions organized in scoping
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon),
+and Windows (x86_64) ship with every release. One line, no toolchain:
+
 ```bash
-cargo install existence
+# Linux, macOS, and Git Bash / MSYS2 on Windows
+curl -fsSL https://raw.githubusercontent.com/existence-lang/existence/main/install.sh | sh
 ```
 
-Or build from source:
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/existence-lang/existence/main/install.ps1 | iex
+```
+
+The installer puts `existence` (and its alias `xist`) in `~/.local/bin`
+(`%LOCALAPPDATA%\existence\bin` on Windows) and prints a PATH hint if needed.
+Pin a version with `EXISTENCE_VERSION=v0.4.1`, or change the target directory
+with `EXISTENCE_INSTALL_DIR`. The same line works in CI:
+
+```yaml
+- run: curl -fsSL https://raw.githubusercontent.com/existence-lang/existence/main/install.sh | EXISTENCE_VERSION=v0.4.1 sh
+- run: ~/.local/bin/existence --ontology ontology lint
+```
+
+With a Rust toolchain, `cargo install existence` works too. Or build from source:
 
 ```bash
 git clone https://github.com/existence-lang/existence
