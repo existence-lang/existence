@@ -4,11 +4,13 @@
 //! `skos:ConceptScheme`, rings become `skos:Collection`s, the lay definition
 //! (first line of the Ontology section, SPEC rule 2) becomes
 //! `skos:definition`, and the four template sections are carried verbatim as
-//! `xl:` annotation literals. `[term](./term.md)` links are untyped in the
-//! source, so they can only be emitted as `skos:related`.
+//! `xl:` annotation literals. `[term](./term.md "broader")` /
+//! `"narrower"` links (SPEC "Typed links") become `skos:broader` /
+//! `skos:narrower` with the inverse emitted on the target; untitled links are
+//! `skos:related`.
 
 use crate::config::Config;
-use crate::markdown::{self, Node};
+use crate::markdown::{self, Node, Relation};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,7 +47,12 @@ pub struct ExportNode {
     pub axiology: Option<String>,
     pub ethics: Option<String>,
     pub epistemology: Option<String>,
-    /// Outbound `[term](./term.md)` links to other exported nodes.
+    /// Targets of `"broader"` links, plus inverses of other nodes' `"narrower"` links.
+    pub broader: Vec<String>,
+    /// Targets of `"narrower"` links, plus inverses of other nodes' `"broader"` links.
+    pub narrower: Vec<String>,
+    /// Untitled `[term](./term.md)` links to other exported nodes, minus any
+    /// target already typed broader/narrower.
     pub related: Vec<String>,
     /// External `http(s)` references.
     pub see_also: Vec<String>,
@@ -184,10 +191,29 @@ pub fn build(
             .map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
         let node = Node::parse(&content).map_err(|e| format!("{}: {e}", file.display()))?;
 
-        let related: Vec<String> = markdown::extract_unique_links(&content)
-            .into_iter()
-            .filter(|link| link != term && existing_terms.contains(link) && included(link))
-            .collect();
+        // First relation declared for a target wins; lint warns on conflicts.
+        let mut broader = Vec::new();
+        let mut narrower = Vec::new();
+        let mut related = Vec::new();
+        for link in markdown::extract_typed_links(&content) {
+            let target = &link.term;
+            if target == term || !existing_terms.contains(target) || !included(target) {
+                continue;
+            }
+            let bucket = match link.relation {
+                Relation::Broader => &mut broader,
+                Relation::Narrower => &mut narrower,
+                Relation::Related => &mut related,
+            };
+            if !bucket.contains(target) {
+                bucket.push(target.clone());
+            }
+        }
+        related.retain(|t| !broader.contains(t) && !narrower.contains(t));
+        narrower.retain(|t| !broader.contains(t));
+        broader.sort();
+        narrower.sort();
+        related.sort();
         let see_also: Vec<String> = markdown::extract_external_links(&content)
             .into_iter()
             .filter(|url| is_safe_iri(url))
@@ -205,10 +231,14 @@ pub fn build(
             axiology: node.axiology.clone(),
             ethics: node.ethics.clone(),
             epistemology: node.epistemology.clone(),
+            broader,
+            narrower,
             related,
             see_also,
         });
     }
+
+    add_inverse_hierarchy(&mut nodes);
 
     Ok(ExportGraph {
         base_iri,
@@ -218,6 +248,41 @@ pub fn build(
         rings,
         nodes,
     })
+}
+
+/// `skos:broader` and `skos:narrower` are inverses: a hierarchy declared on
+/// one node is made navigable from the other. A target that is itself
+/// `related` to the source is left alone (hierarchy is the stronger claim).
+fn add_inverse_hierarchy(nodes: &mut [ExportNode]) {
+    let mut add_narrower: Vec<(String, String)> = Vec::new();
+    let mut add_broader: Vec<(String, String)> = Vec::new();
+    for n in nodes.iter() {
+        for b in &n.broader {
+            add_narrower.push((b.clone(), n.term.clone()));
+        }
+        for nar in &n.narrower {
+            add_broader.push((nar.clone(), n.term.clone()));
+        }
+    }
+    for n in nodes.iter_mut() {
+        for (target, source) in add_narrower.iter().chain(add_broader.iter()) {
+            if target != &n.term {
+                continue;
+            }
+            let bucket = if add_narrower.iter().any(|(t, s)| t == target && s == source) {
+                &mut n.narrower
+            } else {
+                &mut n.broader
+            };
+            if !bucket.contains(source) {
+                bucket.push(source.clone());
+            }
+        }
+        n.related
+            .retain(|t| !n.broader.contains(t) && !n.narrower.contains(t));
+        n.broader.sort();
+        n.narrower.sort();
+    }
 }
 
 /// Serialize as Turtle 1.1.
@@ -288,11 +353,14 @@ pub fn to_turtle(g: &ExportGraph) -> String {
                 props.push((pred, vec![literal(text)]));
             }
         }
-        if !n.related.is_empty() {
-            props.push((
-                "skos:related",
-                n.related.iter().map(|t| iri(&g.term_iri(t))).collect(),
-            ));
+        for (pred, targets) in [
+            ("skos:broader", &n.broader),
+            ("skos:narrower", &n.narrower),
+            ("skos:related", &n.related),
+        ] {
+            if !targets.is_empty() {
+                props.push((pred, targets.iter().map(|t| iri(&g.term_iri(t))).collect()));
+            }
         }
         if !n.see_also.is_empty() {
             props.push(("rdfs:seeAlso", n.see_also.iter().map(|u| iri(u)).collect()));
@@ -374,8 +442,14 @@ pub fn to_jsonld(g: &ExportGraph) -> Value {
                 concept.insert(key.into(), lang(text));
             }
         }
-        if !n.related.is_empty() {
-            concept.insert("skos:related".into(), ids(&n.related, &term_iri));
+        for (key, targets) in [
+            ("skos:broader", &n.broader),
+            ("skos:narrower", &n.narrower),
+            ("skos:related", &n.related),
+        ] {
+            if !targets.is_empty() {
+                concept.insert(key.into(), ids(targets, &term_iri));
+            }
         }
         if !n.see_also.is_empty() {
             concept.insert("rdfs:seeAlso".into(), ids(&n.see_also, &as_is));
@@ -479,12 +553,12 @@ terms = ["model"]
         .unwrap();
         std::fs::write(
             src.join("entity.md"),
-            "# Entity\n\n## [Ontology](./ontology.md)\n\nAny **information** in [Existence](./existence.md).\n\nMore about [existence](./existence.md) and [nowhere](./nowhere.md).\n\n## [Axiology](./axiology.md)\n\nSaid \"quoted\" with a\\backslash.\n\n## [Ethics](./ethics.md)\n\nBe kind.\n\n## [Epistemology](./epistemology.md)\n\n<a href=\"https://en.wikipedia.org/wiki/Entity\" target=\"_blank\">Entity</a> and [ref](https://example.org/entity).\n",
+            "# Entity\n\n## [Ontology](./ontology.md)\n\nAny **information** in [Existence](./existence.md \"broader\").\n\nMore about [existence](./existence.md) and [nowhere](./nowhere.md).\n\n## [Axiology](./axiology.md)\n\nSaid \"quoted\" with a\\backslash.\n\n## [Ethics](./ethics.md)\n\nBe kind.\n\n## [Epistemology](./epistemology.md)\n\n<a href=\"https://en.wikipedia.org/wiki/Entity\" target=\"_blank\">Entity</a> and [ref](https://example.org/entity).\n",
         )
         .unwrap();
         std::fs::write(
             src.join("model.md"),
-            "# Model\n\n## [Ontology](./ontology.md)\n\nA [pattern](./pattern.md) of an [entity](./entity.md).\n\n## [Axiology](./axiology.md)\n\nUseful.\n\n## [Epistemology](./epistemology.md)\n\nKnown.\n",
+            "# Model\n\n## [Ontology](./ontology.md)\n\nA [pattern](./pattern.md) of an [entity](./entity.md \"narrower\") or an [orphan](./orphan.md).\n\n## [Axiology](./axiology.md)\n\nUseful.\n\n## [Epistemology](./epistemology.md)\n\nKnown.\n",
         )
         .unwrap();
         std::fs::write(
@@ -521,7 +595,15 @@ terms = ["model"]
             Some("Any information in Existence.")
         );
         // Links dedupe, drop self-links, and drop targets that do not exist.
-        assert_eq!(entity.related, vec!["existence"]);
+        // A target typed once stays out of `related` even when also linked untitled.
+        assert!(entity.related.is_empty());
+        assert_eq!(entity.broader, vec!["existence", "model"]);
+        assert_eq!(entity.narrower, Vec::<String>::new());
+        // Inverses: existence gains entity as narrower; model declared entity narrower.
+        assert_eq!(node(&g, "existence").narrower, vec!["entity"]);
+        assert_eq!(node(&g, "existence").related, Vec::<String>::new());
+        assert_eq!(node(&g, "model").narrower, vec!["entity"]);
+        assert_eq!(node(&g, "model").related, vec!["orphan"]);
         assert_eq!(
             entity.see_also,
             vec![
@@ -532,7 +614,6 @@ terms = ["model"]
         assert!(entity.ethics.is_some());
 
         assert_eq!(node(&g, "orphan").ring, None);
-        assert_eq!(node(&g, "model").related, vec!["entity"]);
     }
 
     #[test]
@@ -543,8 +624,9 @@ terms = ["model"]
         assert_eq!(g.rings[0].level, 1);
         let terms: Vec<&str> = g.nodes.iter().map(|n| n.term.as_str()).collect();
         assert_eq!(terms, vec!["model"]);
-        // `entity` is outside ring 1, so the edge is dropped.
+        // `entity` and `orphan` are outside ring 1, so the edges are dropped.
         assert!(node(&g, "model").related.is_empty());
+        assert!(node(&g, "model").narrower.is_empty());
 
         assert!(build(dir.path(), Some(7), None).is_err());
     }
@@ -590,14 +672,18 @@ terms = ["model"]
         assert!(ttl.contains("skos:prefLabel \"Entity\"@en ;"));
         assert!(ttl.contains("skos:definition \"Any information in Existence.\"@en ;"));
         assert!(ttl.contains("xl:ring 0 ;"));
-        assert!(ttl.contains(&format!("skos:related <{DEFAULT_BASE_IRI}existence>")));
+        assert!(ttl.contains(&format!(
+            "skos:broader <{DEFAULT_BASE_IRI}existence>, <{DEFAULT_BASE_IRI}model> ;"
+        )));
+        assert!(ttl.contains(&format!("skos:narrower <{DEFAULT_BASE_IRI}entity>")));
+        assert!(ttl.contains(&format!("skos:related <{DEFAULT_BASE_IRI}orphan>")));
         assert!(ttl.contains(
             "rdfs:seeAlso <https://en.wikipedia.org/wiki/Entity>, <https://example.org/entity> ."
         ));
         // Section prose is escaped onto one line.
         assert!(ttl.contains("xl:axiology \"Said \\\"quoted\\\" with a\\\\backslash.\"@en ;"));
         assert!(ttl.contains(
-            "xl:ontology \"Any **information** in [Existence](./existence.md).\\n\\nMore about"
+            "xl:ontology \"Any **information** in [Existence](./existence.md \\\"broader\\\").\\n\\nMore about"
         ));
         // No orphan-ring predicate for a term outside every ring.
         let orphan_block = ttl
@@ -642,8 +728,17 @@ terms = ["model"]
         );
         assert_eq!(entity["xl:ring"], 0);
         assert_eq!(
-            entity["skos:related"][0]["@id"],
+            entity["skos:broader"][0]["@id"],
             format!("{DEFAULT_BASE_IRI}existence")
+        );
+        assert!(entity.get("skos:related").is_none());
+        let existence = graph
+            .iter()
+            .find(|n| n["@id"] == format!("{DEFAULT_BASE_IRI}existence"))
+            .unwrap();
+        assert_eq!(
+            existence["skos:narrower"][0]["@id"],
+            format!("{DEFAULT_BASE_IRI}entity")
         );
         assert_eq!(entity["rdfs:seeAlso"].as_array().unwrap().len(), 2);
         assert!(

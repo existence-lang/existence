@@ -78,11 +78,84 @@ fn extract_section(content: &str, section_name: &str) -> Option<String> {
     }
 }
 
-/// Extract all `[term](./term.md)` links from content.
-pub fn extract_links(content: &str) -> Vec<String> {
-    let re = Regex::new(r"\[([^\]]+)\]\(\./([a-z0-9_-]+)\.md\)").unwrap();
+/// `[text](./term.md)` and `[text](./term.md "relation")` links: capture 2 is
+/// the term, capture 3 the optional title.
+const NODE_LINK: &str = r#"\[([^\]]+)\]\(\./([a-z0-9_-]+)\.md(?:\s+"([^"]*)")?\)"#;
+
+/// The SKOS relation a node link asserts (SPEC "Typed links"). An untitled
+/// link is `Related`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Relation {
+    Broader,
+    Narrower,
+    Related,
+}
+
+impl Relation {
+    /// Parse a link title; `None` for anything outside the recognized vocabulary.
+    pub fn parse(title: &str) -> Option<Relation> {
+        match title.trim().to_ascii_lowercase().as_str() {
+            "broader" => Some(Relation::Broader),
+            "narrower" => Some(Relation::Narrower),
+            "related" => Some(Relation::Related),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Relation::Broader => "broader",
+            Relation::Narrower => "narrower",
+            Relation::Related => "related",
+        }
+    }
+}
+
+/// One `[text](./term.md "relation")` link with its relation resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TypedLink {
+    pub term: String,
+    pub relation: Relation,
+    /// The raw title when it was not a recognized relation (the link then
+    /// counts as `Related`, and lint warns).
+    pub unknown_title: Option<String>,
+}
+
+/// Extract all node links in document order, keeping duplicates.
+pub fn extract_typed_links(content: &str) -> Vec<TypedLink> {
+    let re = Regex::new(NODE_LINK).unwrap();
     re.captures_iter(content)
-        .map(|cap| cap[2].to_string())
+        .map(|cap| {
+            let term = cap[2].to_string();
+            match cap.get(3).map(|m| m.as_str()) {
+                None => TypedLink {
+                    term,
+                    relation: Relation::Related,
+                    unknown_title: None,
+                },
+                Some(title) => match Relation::parse(title) {
+                    Some(relation) => TypedLink {
+                        term,
+                        relation,
+                        unknown_title: None,
+                    },
+                    None => TypedLink {
+                        term,
+                        relation: Relation::Related,
+                        unknown_title: Some(title.to_string()),
+                    },
+                },
+            }
+        })
+        .collect()
+}
+
+/// Extract all `[term](./term.md)` link targets from content (titled or not).
+pub fn extract_links(content: &str) -> Vec<String> {
+    extract_typed_links(content)
+        .into_iter()
+        .map(|link| link.term)
         .collect()
 }
 
@@ -197,6 +270,28 @@ Contrary to some [cultural](./culture.md) [definitions](./definition.md), Existe
             "[scope](./scope.md) and [entity](./entity.md) plus [pattern](./pattern.md)",
         );
         assert_eq!(links, vec!["scope", "entity", "pattern"]);
+    }
+
+    #[test]
+    fn test_extract_typed_links() {
+        let links = extract_typed_links(
+            "[a](./information.md \"broader\") [b](./system.md \"Narrower\") \
+             [c](./scope.md) [d](./scope.md \"related\") [e](./soul.md \"part-of\")",
+        );
+        assert_eq!(links.len(), 5);
+        assert_eq!(links[0].term, "information");
+        assert_eq!(links[0].relation, Relation::Broader);
+        assert_eq!(links[1].relation, Relation::Narrower);
+        assert_eq!(links[2].relation, Relation::Related);
+        assert_eq!(links[2].unknown_title, None);
+        assert_eq!(links[3].relation, Relation::Related);
+        assert_eq!(links[4].relation, Relation::Related);
+        assert_eq!(links[4].unknown_title.as_deref(), Some("part-of"));
+        // Titled links still count as plain links.
+        assert_eq!(
+            extract_unique_links("[a](./b.md \"broader\") [c](./a.md)"),
+            vec!["a", "b"]
+        );
     }
 
     #[test]

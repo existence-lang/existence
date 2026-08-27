@@ -78,6 +78,8 @@ Checks:
 - Title (`# Term`) is present
 - Required sections: `## [Ontology]`, `## [Axiology]`, `## [Epistemology]`
 - Broken links: `[term](./term.md)` references where `src/term.md` doesn't exist
+- Typed links (warning): a link title outside `broader` | `narrower` | `related`,
+  or one target typed both broader and narrower
 
 Warnings (advisory — never fail the run; `###` subsections are non-normative):
 - `## Ontology` subsections outside `Pattern` | `Senses` (the pattern-node shape)
@@ -114,9 +116,10 @@ existence export 0 --base-iri https://example.org/ontology/
 Mapping: title → `skos:prefLabel`; the lay definition (first Ontology line) →
 `skos:definition`; the Ontology / Axiology / Ethics / Epistemology sections →
 `xl:ontology` / `xl:axiology` / `xl:ethics` / `xl:epistemology` literals;
-`[term](./term.md)` links → `skos:related` (links are untyped, so no
-broader/narrower); external `href` / `[text](https://…)` references →
-`rdfs:seeAlso`; rings → `skos:Collection` with `skos:member` and `xl:ring`;
+`[term](./term.md "broader")` / `"narrower"` links → `skos:broader` /
+`skos:narrower` (the inverse is emitted on the target); untitled
+`[term](./term.md)` links → `skos:related`; external `href` /
+`[text](https://…)` references → `rdfs:seeAlso`; rings → `skos:Collection` with `skos:member` and `xl:ring`;
 Ring 0 terms → `skos:hasTopConcept` of the scheme. Term IRIs are
 `{base_iri}{term}` — set `meta.base_iri` (and optionally `meta.vocab_iri`) in
 `existence.toml` or pass `--base-iri`. The Turtle output parses with

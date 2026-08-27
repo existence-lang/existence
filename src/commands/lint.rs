@@ -45,6 +45,8 @@ const SUBSECTION_VOCABULARY: [(&str, &[&[&str]]); 2] = [
 /// Warnings:
 /// - Ontology `###` subsections outside `Pattern` | `Senses` (the pattern-node shape)
 /// - Epistemology `###` subsections outside the recognized vocabulary
+/// - Typed links: a link title outside `broader` | `narrower` | `related`, or
+///   one target typed both broader and narrower
 pub fn run(ontology_dir: &Path, path: Option<&str>) -> Result<(), String> {
     let src_dir = match path {
         Some(p) => {
@@ -229,6 +231,42 @@ fn check_subsections(content: &str) -> Vec<String> {
     warnings
 }
 
+/// Typed-link checks (SPEC "Typed links"): unknown relation titles and a
+/// target declared both broader and narrower. Advisory only.
+fn check_link_relations(content: &str) -> Vec<String> {
+    use crate::markdown::Relation;
+    let mut warnings = Vec::new();
+    let mut hierarchy: Vec<(String, Relation)> = Vec::new();
+    for link in markdown::extract_typed_links(content) {
+        if let Some(title) = &link.unknown_title {
+            warnings.push(format!(
+                "Unknown link relation \"{title}\" on ./{}.md (expected broader | narrower | related)",
+                link.term
+            ));
+            continue;
+        }
+        if link.relation == Relation::Related {
+            continue;
+        }
+        if let Some((_, other)) = hierarchy
+            .iter()
+            .find(|(term, rel)| term == &link.term && *rel != link.relation)
+        {
+            warnings.push(format!(
+                "Conflicting link relations for ./{}.md: {} and {}",
+                link.term,
+                other.as_str(),
+                link.relation.as_str()
+            ));
+            continue;
+        }
+        if !hierarchy.iter().any(|(term, _)| term == &link.term) {
+            hierarchy.push((link.term.clone(), link.relation));
+        }
+    }
+    warnings
+}
+
 fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> LintFindings {
     let mut errors = Vec::new();
 
@@ -270,7 +308,11 @@ fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> Lin
 
     LintFindings {
         errors,
-        warnings: check_subsections(content),
+        warnings: {
+            let mut warnings = check_subsections(content);
+            warnings.extend(check_link_relations(content));
+            warnings
+        },
     }
 }
 
@@ -495,5 +537,47 @@ Knowledge.
         // "bar" and "ontology" are broken, "foo" is OK
         assert!(errors.iter().any(|e| e.contains("bar")));
         assert!(!errors.iter().any(|e| e.contains("[foo]")));
+    }
+
+    #[test]
+    fn test_typed_link_warnings() {
+        let base = "# Entity\n\n## [Ontology](./ontology.md)\n\nX\n\n## [Axiology](./axiology.md)\n\nY\n\n## [Epistemology](./epistemology.md)\n\n";
+        let terms: Vec<String> = [
+            "ontology",
+            "axiology",
+            "epistemology",
+            "existence",
+            "system",
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+
+        let clean = format!(
+            "{base}[a](./existence.md \"broader\") [b](./system.md \"narrower\") [c](./existence.md)"
+        );
+        let findings = lint_content(&clean, "entity.md", &terms);
+        assert!(findings.errors.is_empty());
+        assert!(findings.warnings.is_empty(), "{:?}", findings.warnings);
+
+        let unknown = format!("{base}[a](./existence.md \"part-of\")");
+        let findings = lint_content(&unknown, "entity.md", &terms);
+        assert!(findings.errors.is_empty());
+        assert_eq!(findings.warnings.len(), 1);
+        assert!(findings.warnings[0].contains("Unknown link relation \"part-of\""));
+
+        let conflict =
+            format!("{base}[a](./existence.md \"broader\") [b](./existence.md \"narrower\")");
+        let findings = lint_content(&conflict, "entity.md", &terms);
+        assert_eq!(findings.warnings.len(), 1);
+        assert!(
+            findings.warnings[0]
+                .contains("Conflicting link relations for ./existence.md: broader and narrower")
+        );
+
+        // A titled link to a missing node is still a broken link.
+        let broken = format!("{base}[a](./nowhere.md \"broader\")");
+        let findings = lint_content(&broken, "entity.md", &terms);
+        assert_eq!(findings.errors.len(), 1);
     }
 }
