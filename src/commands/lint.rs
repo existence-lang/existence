@@ -15,12 +15,22 @@ struct LintFindings {
     warnings: Vec<String>,
 }
 
-/// The recognized Epistemology subsection vocabulary, as (kernel spelling, plain spelling)
-/// pairs. Subsection headings are non-normative per SPEC.md, so anything outside this set
-/// is a warning, not an error.
-const EPISTEMOLOGY_SUBSECTIONS: [(&str, &str); 2] = [
-    ("Cultural Definition", "Sources"),
-    ("Pattern Expression", "Examples"),
+/// The recognized `###` subsection vocabulary per `##` section, as
+/// (section, spelling groups) — each group lists the accepted spellings of one
+/// subsection (kernel spelling first, plain spelling second where one exists).
+/// Subsection headings are non-normative per SPEC.md, so anything outside a
+/// section's set is a warning, not an error; sections absent from this table
+/// (Axiology, Ethics) accept any subsection silently.
+const SUBSECTION_VOCABULARY: [(&str, &[&[&str]]); 2] = [
+    // A pattern node carries the invariant and its per-scale senses under Ontology.
+    ("Ontology", &[&["Pattern"], &["Senses"]]),
+    (
+        "Epistemology",
+        &[
+            &["Cultural Definition", "Sources"],
+            &["Pattern Expression", "Examples"],
+        ],
+    ),
 ];
 
 /// Validate ontology nodes against SPEC.md rules.
@@ -33,6 +43,7 @@ const EPISTEMOLOGY_SUBSECTIONS: [(&str, &str); 2] = [
 /// - Broken links: references to `./term.md` where `src/term.md` doesn't exist
 ///
 /// Warnings:
+/// - Ontology `###` subsections outside `Pattern` | `Senses` (the pattern-node shape)
 /// - Epistemology `###` subsections outside the recognized vocabulary
 pub fn run(ontology_dir: &Path, path: Option<&str>) -> Result<(), String> {
     let src_dir = match path {
@@ -180,32 +191,38 @@ fn normalize_heading(line: &str) -> String {
     out.trim().to_string()
 }
 
-/// Warn on `###` headings under `## Epistemology` that fall outside the recognized
-/// subsection vocabulary. Subsections are non-normative, so this never errors.
-fn check_epistemology_subsections(content: &str) -> Vec<String> {
+/// Warn on `###` headings that fall outside the recognized subsection vocabulary of
+/// the `##` section they sit under (see `SUBSECTION_VOCABULARY`). Subsections are
+/// non-normative, so this never errors.
+fn check_subsections(content: &str) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut in_epistemology = false;
+    let mut current: Option<&(&str, &[&[&str]])> = None;
     for line in content.lines() {
         let t = line.trim();
         if t.starts_with("## ") {
-            in_epistemology = t.contains("Epistemology");
+            current = SUBSECTION_VOCABULARY
+                .iter()
+                .find(|(section, _)| t.contains(section));
             continue;
         }
-        if !in_epistemology || !t.starts_with("### ") {
+        let Some((section, groups)) = current else {
+            continue;
+        };
+        if !t.starts_with("### ") {
             continue;
         }
         let heading = normalize_heading(t);
-        let recognized = EPISTEMOLOGY_SUBSECTIONS
+        let recognized = groups
             .iter()
-            .any(|(kernel, plain)| heading == *kernel || heading == *plain);
+            .any(|spellings| spellings.iter().any(|s| heading == *s));
         if !recognized {
-            let vocabulary = EPISTEMOLOGY_SUBSECTIONS
+            let vocabulary = groups
                 .iter()
-                .map(|(kernel, plain)| format!("{kernel} | {plain}"))
+                .map(|spellings| spellings.join(" | "))
                 .collect::<Vec<_>>()
                 .join(", ");
             warnings.push(format!(
-                "Non-standard Epistemology subsection `{heading}` — recognized vocabulary: {vocabulary}"
+                "Non-standard {section} subsection `{heading}` — recognized vocabulary: {vocabulary}"
             ));
         }
     }
@@ -253,7 +270,7 @@ fn lint_content(content: &str, filename: &str, existing_terms: &[String]) -> Lin
 
     LintFindings {
         errors,
-        warnings: check_epistemology_subsections(content),
+        warnings: check_subsections(content),
     }
 }
 
@@ -362,14 +379,76 @@ A near miss.
     }
 
     #[test]
-    fn test_subsections_outside_epistemology_are_ignored() {
+    fn test_subsections_in_unlisted_sections_are_ignored() {
         let content = r#"# Test
 
 ## Ontology
 
+Definition.
+
+## Axiology
+
 ### Anything Goes Here
 
+Value.
+
+## Ethics
+
+### Or Here
+
+Care.
+
+## Epistemology
+
+Knowledge.
+"#;
+        let findings = lint_content(content, "test.md", &[]);
+        assert!(findings.warnings.is_empty(), "got: {:?}", findings.warnings);
+    }
+
+    #[test]
+    fn test_pattern_node_subsections_under_ontology_no_warning() {
+        let content = r#"# Test
+
+## Ontology
+
+Lay definition.
+
+### [Pattern](./pattern.md)
+
+**Context.** Recurs at several scales.
+
+### Senses
+
+| Scale | Sense | What it means | How the software spells it |
+|-------|-------|---------------|----------------------------|
+| Product | **Thing** | The product meaning. | `thing_id` |
+
+## Axiology
+
+Value.
+
+## Epistemology
+
+### Examples
+
+Shown.
+"#;
+        let findings = lint_content(content, "test.md", &[]);
+        assert!(findings.warnings.is_empty(), "got: {:?}", findings.warnings);
+    }
+
+    #[test]
+    fn test_non_standard_ontology_subsection_warns_without_error() {
+        let content = r#"# Test
+
+## Ontology
+
 Definition.
+
+### Meanings
+
+A near miss for Senses.
 
 ## Axiology
 
@@ -380,7 +459,10 @@ Value.
 Knowledge.
 "#;
         let findings = lint_content(content, "test.md", &[]);
-        assert!(findings.warnings.is_empty());
+        assert!(findings.errors.is_empty(), "got: {:?}", findings.errors);
+        assert_eq!(findings.warnings.len(), 1);
+        assert!(findings.warnings[0].contains("Non-standard Ontology subsection `Meanings`"));
+        assert!(findings.warnings[0].contains("Pattern, Senses"));
     }
 
     #[test]

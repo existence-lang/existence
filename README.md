@@ -79,6 +79,10 @@ Checks:
 - Required sections: `## [Ontology]`, `## [Axiology]`, `## [Epistemology]`
 - Broken links: `[term](./term.md)` references where `src/term.md` doesn't exist
 
+Warnings (advisory — never fail the run; `###` subsections are non-normative):
+- `## Ontology` subsections outside `Pattern` | `Senses` (the pattern-node shape)
+- `## Epistemology` subsections outside `Cultural Definition` | `Sources`, `Pattern Expression` | `Examples`
+
 Exit code 0 if clean, 1 if errors found.
 
 ### Generate relationship graph
