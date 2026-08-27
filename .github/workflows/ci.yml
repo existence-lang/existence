@@ -40,6 +40,33 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  export-validate:
+    name: RDF export validates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install raptor (rapper)
+        run: sudo apt-get update && sudo apt-get install -y raptor2-utils
+
+      - name: Fetch the reference ontology
+        run: git clone --depth 1 https://github.com/existence-lang/ontology ontology
+
+      - name: Export Turtle and JSON-LD
+        run: |
+          cargo run --quiet --bin existence -- --ontology ontology export --format turtle > ontology.ttl
+          cargo run --quiet --bin existence -- --ontology ontology export --format jsonld > ontology.jsonld
+
+      - name: Validate Turtle parses
+        run: rapper -i turtle -c ontology.ttl
+
+      - name: Validate JSON-LD shape
+        run: |
+          python3 -c "import json; d=json.load(open('ontology.jsonld')); assert d['@context'] and d['@graph'], 'missing @context/@graph'; print(len(d['@graph']), 'graph nodes')"
+
   install-smoke:
     name: Installer smoke (${{ matrix.os }})
     strategy:

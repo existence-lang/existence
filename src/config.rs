@@ -17,6 +17,12 @@ pub struct Config {
 pub struct Meta {
     pub name: String,
     pub description: String,
+    /// Base IRI for RDF export; term IRIs are `{base_iri}{term}`.
+    /// Defaults to `https://existence-lang.github.io/ontology/`.
+    pub base_iri: Option<String>,
+    /// Namespace for the `xl:` metamodel vocabulary in RDF export.
+    /// Defaults to `https://existence-lang.github.io/vocab#`.
+    pub vocab_iri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

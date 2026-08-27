@@ -6,6 +6,7 @@ pub mod markdown;
 /// Note: `completions` is excluded from the library as it depends on
 /// the CLI `Cli` struct defined in main.rs.
 pub mod commands {
+    pub mod export;
     pub mod fetch;
     pub mod graph;
     pub mod lint;

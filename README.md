@@ -98,6 +98,30 @@ existence graph 0 | dot -Tpng -o kernel.png
 existence graph --format json
 ```
 
+### Export as RDF (SKOS)
+
+```bash
+# Turtle (default) — one skos:Concept per term, one skos:Collection per ring
+existence export > ontology.ttl
+
+# JSON-LD with a prefix @context and a flat @graph
+existence export --format jsonld > ontology.jsonld
+
+# Only Ring 0, under your own base IRI
+existence export 0 --base-iri https://example.org/ontology/
+```
+
+Mapping: title → `skos:prefLabel`; the lay definition (first Ontology line) →
+`skos:definition`; the Ontology / Axiology / Ethics / Epistemology sections →
+`xl:ontology` / `xl:axiology` / `xl:ethics` / `xl:epistemology` literals;
+`[term](./term.md)` links → `skos:related` (links are untyped, so no
+broader/narrower); external `href` / `[text](https://…)` references →
+`rdfs:seeAlso`; rings → `skos:Collection` with `skos:member` and `xl:ring`;
+Ring 0 terms → `skos:hasTopConcept` of the scheme. Term IRIs are
+`{base_iri}{term}` — set `meta.base_iri` (and optionally `meta.vocab_iri`) in
+`existence.toml` or pass `--base-iri`. The Turtle output parses with
+`rapper -i turtle -c ontology.ttl` and loads into any SPARQL store.
+
 ### Fetch an ontology
 
 ```bash
@@ -118,6 +142,9 @@ Ontologies are configured via `existence.toml`:
 [meta]
 name = "existence-lang/ontology"
 description = "Reference existential ontology"
+# Optional: RDF export identity (defaults shown)
+base_iri = "https://existence-lang.github.io/ontology/"
+vocab_iri = "https://existence-lang.github.io/vocab#"
 
 [rings.0]
 name = "kernel"
@@ -141,6 +168,7 @@ upstream = "github:existence-lang/ontology"
 | `scope [ring]` | List terms at a ring level | Implemented |
 | `lint [path]` | Validate nodes against SPEC.md rules | Implemented |
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
+| `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `fetch [source]` | Clone or pull ontology from GitHub | Implemented |
 | `install` | Set up ~/.claude integration | Planned |
 | `serve` | Start local API server | Planned |

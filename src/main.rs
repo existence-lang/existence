@@ -70,6 +70,20 @@ enum Commands {
         format: String,
     },
 
+    /// Export the ontology as RDF (SKOS) in Turtle or JSON-LD
+    Export {
+        /// Filter to a specific ring level
+        ring: Option<u32>,
+
+        /// Output format: "turtle" (default) or "jsonld"
+        #[arg(long, default_value = "turtle")]
+        format: String,
+
+        /// Base IRI for term identity (overrides `meta.base_iri` in existence.toml)
+        #[arg(long)]
+        base_iri: Option<String>,
+    },
+
     /// Clone or pull an ontology from a GitHub repo
     Fetch {
         /// Source in format github:org/repo. If omitted, reads existence.toml
@@ -143,6 +157,14 @@ fn main() {
         Commands::Graph { ring, ref format } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
             commands::graph::run(&ontology_dir, ring, format)
+        }
+        Commands::Export {
+            ring,
+            ref format,
+            ref base_iri,
+        } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            commands::export::run(&ontology_dir, ring, format, base_iri.as_deref())
         }
         Commands::New {
             ref term,

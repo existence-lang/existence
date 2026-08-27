@@ -94,6 +94,42 @@ pub fn extract_unique_links(content: &str) -> Vec<String> {
     links
 }
 
+/// Extract all `http(s)` references: HTML `href="..."` anchors and markdown
+/// `[text](https://...)` links. Sorted and deduplicated.
+pub fn extract_external_links(content: &str) -> Vec<String> {
+    let re = Regex::new(r#"href="(https?://[^"\s]+)"|\]\((https?://[^)\s]+)\)"#).unwrap();
+    let mut links: Vec<String> = re
+        .captures_iter(content)
+        .filter_map(|cap| cap.get(1).or_else(|| cap.get(2)))
+        .map(|m| m.as_str().to_string())
+        .collect();
+    links.sort();
+    links.dedup();
+    links
+}
+
+/// The lay definition: the first non-empty line under `## [Ontology]`
+/// (SPEC rule 2). `None` when the node has no Ontology section.
+pub fn extract_definition(content: &str) -> Option<String> {
+    let node = Node::parse(content).ok()?;
+    let ontology = node.ontology?;
+    ontology
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// Strip markdown links, emphasis, and code ticks from a line of prose.
+pub fn plain_text(text: &str) -> String {
+    let link = Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
+    link.replace_all(text, "$1")
+        .replace("**", "")
+        .replace(['`', '*'], "")
+        .trim()
+        .to_string()
+}
+
 /// List all term names from `src/*.md` files.
 pub fn list_terms(src_dir: &Path) -> Result<Vec<String>, String> {
     let mut terms = Vec::new();
@@ -161,6 +197,28 @@ Contrary to some [cultural](./culture.md) [definitions](./definition.md), Existe
             "[scope](./scope.md) and [entity](./entity.md) plus [pattern](./pattern.md)",
         );
         assert_eq!(links, vec!["scope", "entity", "pattern"]);
+    }
+
+    #[test]
+    fn test_extract_external_links() {
+        let links = extract_external_links(
+            "<a href=\"https://b.example/x\" target=\"_blank\">x</a> [y](https://a.example/y) \
+             [local](./scope.md) <a href=\"https://b.example/x\">again</a>",
+        );
+        assert_eq!(links, vec!["https://a.example/y", "https://b.example/x"]);
+    }
+
+    #[test]
+    fn test_extract_definition_and_plain_text() {
+        assert_eq!(
+            extract_definition(SAMPLE).as_deref(),
+            Some("Everything that 'is', or more simply, everything.")
+        );
+        assert_eq!(extract_definition("# Title\n\n## Axiology\n\nx"), None);
+        assert_eq!(
+            plain_text("Any **[information](./information.md)** in `[Existence](./existence.md)`."),
+            "Any information in Existence."
+        );
     }
 
     #[test]

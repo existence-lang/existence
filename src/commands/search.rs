@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::markdown::Node;
+use crate::markdown;
 use serde::Serialize;
 use std::path::Path;
 
@@ -138,19 +138,11 @@ fn compute_score(term_name: &str, content: &str, query_lower: &str) -> u32 {
     score
 }
 
-/// Extract the one-line definition: the first non-empty line after `## [Ontology]` or `## Ontology`.
+/// The lay definition (first non-empty Ontology line), falling back to the
+/// title when a node has no Ontology section.
 fn extract_definition(content: &str) -> String {
-    // Try parsing via Node for the ontology section
-    if let Ok(node) = Node::parse(content)
-        && let Some(ref ontology) = node.ontology
-    {
-        // Return the first non-empty line as the definition
-        for line in ontology.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
+    if let Some(definition) = markdown::extract_definition(content) {
+        return definition;
     }
 
     // Fallback: return the title if available
