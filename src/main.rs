@@ -84,6 +84,22 @@ enum Commands {
         base_iri: Option<String>,
     },
 
+    /// Run a SPARQL query over the exported ontology (needs the `sparql` feature)
+    Sparql {
+        /// The query text, or `-` to read it from stdin. skos:, rdfs:, dcterms:,
+        /// xsd:, xl:, and `:` (the base IRI) are pre-declared
+        query: String,
+
+        /// SELECT/ASK result format: text (default), json, csv, tsv, or xml.
+        /// CONSTRUCT/DESCRIBE always return Turtle
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Base IRI for term identity (overrides `meta.base_iri` in existence.toml)
+        #[arg(long)]
+        base_iri: Option<String>,
+    },
+
     /// Clone or pull an ontology from a GitHub repo
     Fetch {
         /// Source in format github:org/repo. If omitted, reads existence.toml
@@ -117,8 +133,16 @@ enum Commands {
     /// Set up ~/.claude integration (not yet implemented)
     Install,
 
-    /// Start local API server (not yet implemented)
-    Serve,
+    /// Serve a SPARQL endpoint at http://127.0.0.1:<port>/sparql (needs the `sparql` feature)
+    Serve {
+        /// TCP port to listen on
+        #[arg(long, default_value = "3030")]
+        port: u16,
+
+        /// Base IRI for term identity (overrides `meta.base_iri` in existence.toml)
+        #[arg(long)]
+        base_iri: Option<String>,
+    },
 
     /// Generate static site + JSON API (not yet implemented)
     BuildSite,
@@ -175,6 +199,14 @@ fn main() {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
             commands::new::run(&ontology_dir, term, ring, no_edit, description.as_deref())
         }
+        Commands::Sparql {
+            ref query,
+            ref format,
+            ref base_iri,
+        } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            commands::sparql::run(&ontology_dir, query, format, base_iri.as_deref())
+        }
         Commands::Fetch { ref source } => {
             let ontology_dir = config::resolve_ontology_dir(cli.ontology.as_deref())
                 .unwrap_or_else(|_| PathBuf::from("."));
@@ -189,10 +221,9 @@ fn main() {
             println!("Will set up ~/.claude integration with ontology terms.");
             Ok(())
         }
-        Commands::Serve => {
-            println!("existence serve: not yet implemented");
-            println!("Will start a local API server for ontology queries.");
-            Ok(())
+        Commands::Serve { port, ref base_iri } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            commands::sparql::serve(&ontology_dir, port, base_iri.as_deref())
         }
         Commands::BuildSite => {
             println!("existence build-site: not yet implemented");

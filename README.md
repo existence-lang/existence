@@ -125,6 +125,41 @@ Ring 0 terms → `skos:hasTopConcept` of the scheme. Term IRIs are
 `existence.toml` or pass `--base-iri`. The Turtle output parses with
 `rapper -i turtle -c ontology.ttl` and loads into any SPARQL store.
 
+### Query with SPARQL
+
+SPARQL support is an opt-in cargo feature so the default binary stays small:
+
+```bash
+cargo install existence --features sparql
+```
+
+```bash
+# SELECT / ASK print as a text table by default; --format json|csv|tsv|xml
+existence sparql 'SELECT ?t WHERE { ?t a skos:Concept } ORDER BY ?t'
+existence sparql 'ASK { :entity skos:broader :existence }'
+
+# Multi-line queries from stdin
+existence sparql - --format json <<'Q'
+SELECT ?t (COUNT(?r) AS ?links) WHERE { ?t a skos:Concept . ?t skos:related ?r }
+GROUP BY ?t ORDER BY DESC(?links) LIMIT 10
+Q
+
+# Concepts nothing links to
+existence sparql 'SELECT ?t WHERE { ?t a skos:Concept FILTER NOT EXISTS { ?x skos:related ?t } }'
+```
+
+`skos:`, `rdfs:`, `dcterms:`, `xsd:`, `xl:`, and `:` (the base IRI, so `:entity`)
+are pre-declared unless the query declares them itself. The graph queried is
+exactly what `existence export` prints; CONSTRUCT / DESCRIBE results come back
+as Turtle.
+
+`existence serve` exposes the same store as a
+[SPARQL Protocol](https://www.w3.org/TR/sparql11-protocol/) endpoint on
+localhost (`--port`, default 3030): `GET /sparql?query=…`, `POST /sparql` with
+an `application/sparql-query` body or a form `query=`, and `Accept` selecting
+JSON (default), `text/csv`, `text/tab-separated-values`, or
+`application/sparql-results+xml`.
+
 ### Fetch an ontology
 
 ```bash
@@ -172,9 +207,10 @@ upstream = "github:existence-lang/ontology"
 | `lint [path]` | Validate nodes against SPEC.md rules | Implemented |
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
+| `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
+| `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |
 | `fetch [source]` | Clone or pull ontology from GitHub | Implemented |
 | `install` | Set up ~/.claude integration | Planned |
-| `serve` | Start local API server | Planned |
 | `build-site` | Generate static site + JSON API | Planned |
 | `context <domain>` | Suggest relevant terms for a domain | Planned |
 

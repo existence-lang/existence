@@ -29,6 +29,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 regex = "1"
+oxigraph = { version = "0.5", default-features = false, optional = true }
+tiny_http = { version = "0.12", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# `existence sparql` and the SPARQL endpoint of `existence serve`
+sparql = ["dep:oxigraph", "dep:tiny_http"]

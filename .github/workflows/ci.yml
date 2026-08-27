@@ -40,6 +40,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Clippy (sparql feature)
+        run: cargo clippy --features sparql -- -D warnings
+
+      - name: Tests (sparql feature)
+        run: cargo test --features sparql
+
   export-validate:
     name: RDF export validates
     runs-on: ubuntu-latest

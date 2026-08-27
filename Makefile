@@ -3,6 +3,8 @@
 check:
 	cargo clippy -- -D warnings
 	cargo test
+	cargo clippy --features sparql -- -D warnings
+	cargo test --features sparql
 	cargo fmt -- --check
 
 build-release:
