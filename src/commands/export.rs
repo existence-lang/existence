@@ -17,7 +17,7 @@ use std::path::Path;
 /// `meta.base_iri` and `--base-iri` is not given.
 pub const DEFAULT_BASE_IRI: &str = "https://existence-lang.github.io/ontology/";
 /// Default namespace for the `xl:` metamodel vocabulary.
-pub const DEFAULT_VOCAB_IRI: &str = "https://existence-lang.github.io/vocab#";
+pub const DEFAULT_VOCAB_IRI: &str = "https://existence-lang.github.io/ontology/vocab#";
 
 const SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";

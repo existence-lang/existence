@@ -144,7 +144,7 @@ name = "existence-lang/ontology"
 description = "Reference existential ontology"
 # Optional: RDF export identity (defaults shown)
 base_iri = "https://existence-lang.github.io/ontology/"
-vocab_iri = "https://existence-lang.github.io/vocab#"
+vocab_iri = "https://existence-lang.github.io/ontology/vocab#"
 
 [rings.0]
 name = "kernel"
