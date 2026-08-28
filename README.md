@@ -21,11 +21,11 @@ irm https://raw.githubusercontent.com/existence-lang/existence/main/install.ps1 
 
 The installer puts `existence` (and its alias `xist`) in `~/.local/bin`
 (`%LOCALAPPDATA%\existence\bin` on Windows) and prints a PATH hint if needed.
-Pin a version with `EXISTENCE_VERSION=v0.4.1`, or change the target directory
+Pin a version with `EXISTENCE_VERSION=v0.5.0`, or change the target directory
 with `EXISTENCE_INSTALL_DIR`. The same line works in CI:
 
 ```yaml
-- run: curl -fsSL https://raw.githubusercontent.com/existence-lang/existence/main/install.sh | EXISTENCE_VERSION=v0.4.1 sh
+- run: curl -fsSL https://raw.githubusercontent.com/existence-lang/existence/main/install.sh | EXISTENCE_VERSION=v0.5.0 sh
 - run: ~/.local/bin/existence --ontology ontology lint
 ```
 
