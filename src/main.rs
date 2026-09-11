@@ -111,6 +111,23 @@ enum Commands {
         check: bool,
     },
 
+    /// List the external sources each node cites and the passages it quotes,
+    /// or derive the audit lockfile from them
+    Sources {
+        /// Restrict the listing to one term
+        term: Option<String>,
+
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+
+        /// Write the lockfile (default `audit/sources.lock.json`, relative to
+        /// the ontology) instead of listing; keeps fetch results already
+        /// recorded for URLs and terms that still cite
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = commands::sources::DEFAULT_LOCK)]
+        lock: Option<PathBuf>,
+    },
+
     /// Run a SPARQL query over the exported ontology (needs the `sparql` feature)
     Sparql {
         /// The query text, or `-` to read it from stdin. skos:, rdfs:, dcterms:,
@@ -242,6 +259,14 @@ fn main() {
         } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
             commands::new::run(&ontology_dir, term, ring, no_edit, description.as_deref())
+        }
+        Commands::Sources {
+            ref term,
+            json,
+            ref lock,
+        } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            commands::sources::run(&ontology_dir, term.as_deref(), json, lock.as_deref())
         }
         Commands::Sparql {
             ref query,

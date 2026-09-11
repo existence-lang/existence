@@ -119,6 +119,35 @@ and ring terms without a file are marked missing, so the index doubles as a
 manifest check. JSON carries both the slug (`term`, what `lookup` takes) and
 the `title`, plus `definition` (markdown) and `definition_text` (plain).
 
+### Sources
+
+```bash
+# Every external source each node cites, with the passages it quotes
+existence sources
+existence sources entity
+existence sources --json
+
+# Derive the audit lockfile (audit/sources.lock.json, relative to the ontology)
+existence sources --lock
+existence sources --lock path/to/sources.lock.json
+```
+
+Sources are derived from the markdown SPEC rules 7 and 8 already mandate: an
+`<a href="…" target="_blank">` anchor followed by `>` blockquotes of the
+passage relied on, or the inline `> <a href="…">Label</a>: passage` form. One
+entry per anchor, in document order, with its label and quoted lines; a
+blockquote block ends at the next anchor, heading, or prose line, so an anchor
+with nothing quoted under it (a keynote video, a mid-paragraph reference) is
+listed with no quotes.
+
+`--lock` aggregates the same data by URL into the lockfile the audit will
+maintain: `cited_by` (terms citing the URL), `fetched_at`, `status`,
+`content_sha256`, `archive` (a pinned Wayback snapshot), and `quotes`, a
+per-term status. Listing never touches the network, so a new entry carries
+`fetched_at: null` and `quotes: { term: "unchecked" }`; rewriting the lock
+keeps the fetch results already recorded for URLs and terms that still cite,
+and drops entries nothing cites any more.
+
 ### Generate relationship graph
 
 ```bash
@@ -239,6 +268,7 @@ upstream = "github:existence-lang/ontology"
 | `lint [path]` | Validate nodes against SPEC.md rules | Implemented |
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
+| `sources [term]` | External sources and quoted passages per node; `--lock` writes `audit/sources.lock.json` | Implemented |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |
