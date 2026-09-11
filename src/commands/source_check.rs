@@ -28,6 +28,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Wayback availability API.
 pub const DEFAULT_WAYBACK: &str = "https://archive.org/wayback/available";
+/// Wayback CDX index, listing every snapshot of a URL.
+pub const DEFAULT_CDX: &str = "https://web.archive.org/cdx/search/cdx";
+/// Wayback snapshot base: `<base>/<timestamp>/<url>` is a copy.
+pub const DEFAULT_ARCHIVE_WEB: &str = "https://web.archive.org/web";
+/// Snapshots are tried closest to this date first (`YYYYMMDD`).
+pub const DEFAULT_ARCHIVE_AROUND: &str = "20150101";
+/// How many snapshots are tried before a drifted quote stays unpinned.
+const PIN_CANDIDATES: usize = 6;
 
 /// Fuzzy threshold for a quote to count as moved rather than missing.
 pub const MOVED_THRESHOLD: f64 = 0.9;
@@ -41,6 +49,12 @@ pub struct SourceOptions {
     pub rate: Duration,
     /// Wayback availability endpoint (`?url=` is appended).
     pub wayback: String,
+    /// Wayback CDX endpoint used to list snapshots when a quote has drifted.
+    pub cdx: String,
+    /// Snapshot base URL: `<base>/<timestamp>/<url>`.
+    pub archive_web: String,
+    /// `YYYYMMDD`; snapshots nearest this date are tried first.
+    pub archive_around: String,
     /// Per-request timeout.
     pub timeout: Duration,
 }
@@ -51,6 +65,9 @@ impl Default for SourceOptions {
             lock: PathBuf::from(sources::DEFAULT_LOCK),
             rate: Duration::from_secs(1),
             wayback: DEFAULT_WAYBACK.to_string(),
+            cdx: DEFAULT_CDX.to_string(),
+            archive_web: DEFAULT_ARCHIVE_WEB.to_string(),
+            archive_around: DEFAULT_ARCHIVE_AROUND.to_string(),
             timeout: Duration::from_secs(20),
         }
     }
@@ -96,13 +113,24 @@ impl Client {
             }
         }
         self.last = Some(Instant::now());
-        match self.agent.get(url).call() {
-            Ok(mut resp) => {
-                let status = resp.status().as_u16();
-                let body = resp.body_mut().read_to_string().unwrap_or_default();
-                Fetch::Response { status, body }
+        // A transport error is retried once after one rate interval: a reset
+        // connection must not write off a whole host (or a snapshot) for the run.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.agent.get(url).call() {
+                Ok(mut resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.body_mut().read_to_string().unwrap_or_default();
+                    return Fetch::Response { status, body };
+                }
+                Err(e) if attempt < 2 => {
+                    std::thread::sleep(self.rate);
+                    self.last = Some(Instant::now());
+                    let _ = e;
+                }
+                Err(e) => return Fetch::Unreachable(e.to_string()),
             }
-            Err(e) => Fetch::Unreachable(e.to_string()),
         }
     }
 }
@@ -122,6 +150,8 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
     let mut client = Client::new(opts);
     let mut findings = Vec::new();
     let now = rfc3339_now();
+    // URLs whose snapshot was found this run, for `--fix` to write beside the anchor.
+    let mut pinned_now: Vec<String> = Vec::new();
 
     for (url, entry) in lock.iter_mut() {
         let Some(host) = host_of(url) else { continue };
@@ -163,19 +193,73 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                 let text = html_to_text(&body);
                 entry.content_sha256 = Some(sha256_hex(&text));
                 let page = normalise(&text);
-                for term in &entry.cited_by {
-                    let quotes = quotes_for(&all, term, url);
-                    let (status_word, worst) = quote_status(&page, &quotes);
+                let live: Vec<(String, Vec<String>, &'static str, Option<String>)> = entry
+                    .cited_by
+                    .iter()
+                    .map(|term| {
+                        let quotes = quotes_for(&all, term, url);
+                        let (status_word, worst) = quote_status(&page, &quotes);
+                        (term.clone(), quotes, status_word, worst)
+                    })
+                    .collect();
+                // A quote the live page has lost is looked for in the pinned
+                // snapshot, or a snapshot is searched for and pinned.
+                let mut archived_page: Option<String> = None;
+                if live.iter().any(|(_, _, s, _)| *s == "missing") {
+                    let all_quotes: Vec<String> = live
+                        .iter()
+                        .flat_map(|(_, q, _, _)| q.iter().cloned())
+                        .collect();
+                    match &entry.archive {
+                        Some(pin) => archived_page = fetch_archived_page(&mut client, pin),
+                        None => {
+                            if let Some((pin, text)) = find_pin(&mut client, opts, url, &all_quotes)
+                            {
+                                entry.archive = Some(pin);
+                                archived_page = Some(text);
+                                pinned_now.push(url.clone());
+                            }
+                        }
+                    }
+                }
+                for (term, quotes, status_word, worst) in live {
+                    let term = &term;
+                    if status_word == "missing"
+                        && let Some(archived) = &archived_page
+                        && quote_status(archived, &quotes).0 != "missing"
+                    {
+                        entry.quotes.insert(term.clone(), "archived".to_string());
+                        if pinned_now.contains(url) {
+                            let pin = entry.archive.clone().unwrap_or_default();
+                            findings.push(source_finding(
+                                "quote_missing",
+                                "error",
+                                term,
+                                format!(
+                                    "quoted passage no longer found on {url} but is in the snapshot {pin}: \u{201c}{}\u{201d}",
+                                    clip(&worst.unwrap_or_default())
+                                ),
+                                Some(format!("pin the archived copy {pin} beside the link")),
+                            ));
+                        }
+                        continue;
+                    }
                     entry.quotes.insert(term.clone(), status_word.to_string());
                     match status_word {
                         "missing" => findings.push(source_finding(
                             "quote_missing",
                             "error",
                             term,
-                            format!(
-                                "quoted passage no longer found on {url}: \u{201c}{}\u{201d}",
-                                clip(&worst.unwrap_or_default())
-                            ),
+                            match &entry.archive {
+                                Some(pin) => format!(
+                                    "quoted passage found neither on {url} nor in its pinned copy {pin}: \u{201c}{}\u{201d}",
+                                    clip(&worst.unwrap_or_default())
+                                ),
+                                None => format!(
+                                    "quoted passage no longer found on {url}: \u{201c}{}\u{201d}",
+                                    clip(&worst.unwrap_or_default())
+                                ),
+                            },
                             None,
                         )),
                         "moved" => findings.push(source_finding(
@@ -197,6 +281,7 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
 
     if fix {
         apply_dead_link_fixes(ontology_dir, &lock, &mut findings)?;
+        apply_pin_fixes(ontology_dir, &lock, &pinned_now, &mut findings)?;
     }
     sources::write_lock(&lock_path, &lock)?;
     Ok(findings)
@@ -253,6 +338,134 @@ fn apply_dead_link_fixes(
         }
     }
     Ok(())
+}
+
+/// Write ` <a href="<snapshot>" target="_blank">(archived YYYY-MM-DD)</a>`
+/// after the anchor of every URL pinned this run, in every citing node.
+fn apply_pin_fixes(
+    ontology_dir: &Path,
+    lock: &Lock,
+    pinned_now: &[String],
+    findings: &mut [Finding],
+) -> Result<(), String> {
+    let src_dir = ontology_dir.join("src");
+    for url in pinned_now {
+        let Some(entry) = lock.get(url) else { continue };
+        let Some(archive) = entry.archive.as_ref() else {
+            continue;
+        };
+        let label = match snapshot_date(archive) {
+            Some(date) => format!("(archived {date})"),
+            None => "(archived)".to_string(),
+        };
+        let pin = format!(" <a href=\"{archive}\" target=\"_blank\">{label}</a>");
+        let needle = format!("href=\"{url}\"");
+        for term in &entry.cited_by {
+            let path = src_dir.join(format!("{term}.md"));
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+            let mut changed = false;
+            let mut out = String::with_capacity(content.len() + 128);
+            for line in content.split_inclusive('\n') {
+                if let Some(at) = line.find(&needle)
+                    && !line.contains(archive.as_str())
+                    && let Some(close) = line[at..].find("</a>")
+                {
+                    let cut = at + close + "</a>".len();
+                    out.push_str(&line[..cut]);
+                    out.push_str(&pin);
+                    out.push_str(&line[cut..]);
+                    changed = true;
+                } else {
+                    out.push_str(line);
+                }
+            }
+            if !changed {
+                continue;
+            }
+            std::fs::write(&path, out)
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+            for f in findings.iter_mut().filter(|f| {
+                f.check == "quote_missing" && f.term == *term && f.message.contains(url.as_str())
+            }) {
+                f.fixed = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `YYYY-MM-DD` of a snapshot URL's timestamp segment.
+fn snapshot_date(archive: &str) -> Option<String> {
+    let re = regex::Regex::new(r"/(\d{8})\d{0,6}(?:id_)?/https?://").ok()?;
+    let ts = re.captures(archive)?.get(1)?.as_str().to_string();
+    Some(format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8]))
+}
+
+/// The raw (`id_`) form of a snapshot URL, without the Wayback toolbar.
+fn raw_snapshot_url(archive: &str) -> String {
+    let re = regex::Regex::new(r"(/\d{4,14})/(https?://)").unwrap();
+    if archive.contains("id_/") {
+        archive.to_string()
+    } else {
+        re.replace(archive, "${1}id_/${2}").into_owned()
+    }
+}
+
+/// The normalised text of a pinned snapshot, if it can be fetched.
+fn fetch_archived_page(client: &mut Client, archive: &str) -> Option<String> {
+    match client.get(&raw_snapshot_url(archive)) {
+        Fetch::Response { status, body } if status < 400 => Some(normalise(&html_to_text(&body))),
+        _ => None,
+    }
+}
+
+/// Search the CDX index for a snapshot of `url` that still carries every
+/// quote, nearest `archive_around` first; at most `PIN_CANDIDATES` fetches.
+fn find_pin(
+    client: &mut Client,
+    opts: &SourceOptions,
+    url: &str,
+    quotes: &[String],
+) -> Option<(String, String)> {
+    let query = format!(
+        "{}?url={}&output=json&filter=statuscode:200&collapse=timestamp:6&limit=200",
+        opts.cdx,
+        percent_encode(url)
+    );
+    let Fetch::Response { status, body } = client.get(&query) else {
+        return None;
+    };
+    if status >= 400 {
+        return None;
+    }
+    let rows: Vec<Vec<String>> = serde_json::from_str(&body).ok()?;
+    let around: i64 = opts.archive_around.get(0..8)?.parse().ok()?;
+    let mut stamps: Vec<(i64, String)> = rows
+        .iter()
+        .skip(1)
+        .filter_map(|row| {
+            let ts = row.get(1)?;
+            let day: i64 = ts.get(0..8)?.parse().ok()?;
+            Some(((day - around).abs(), ts.clone()))
+        })
+        .collect();
+    stamps.sort();
+    stamps.dedup();
+    for (_, ts) in stamps.into_iter().take(PIN_CANDIDATES) {
+        let raw = format!("{}/{ts}id_/{url}", opts.archive_web);
+        let Fetch::Response { status, body } = client.get(&raw) else {
+            continue;
+        };
+        if status >= 400 {
+            continue;
+        }
+        let page = normalise(&html_to_text(&body));
+        if quote_status(&page, quotes).0 != "missing" {
+            return Some((format!("{}/{ts}/{url}", opts.archive_web), page));
+        }
+    }
+    None
 }
 
 /// The closest Wayback snapshot of `url`, if the availability API has one.
@@ -487,12 +700,33 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr().to_ip().unwrap());
         let archive = format!("{base}/archive/20260101000000/gone");
+        let base_in = base.clone();
         std::thread::spawn(move || {
+            let base = base_in;
             for req in server.incoming_requests() {
                 let url = req.url().to_string();
                 log.lock().unwrap().push(url.clone());
                 let (code, body) = if url == "/live" {
                     (200, "<p>Anything in Existence that can be distinguished from anything else.</p>".to_string())
+                } else if url == "/drifted" {
+                    (
+                        200,
+                        "<p>A page rewritten since it was quoted.</p>".to_string(),
+                    )
+                } else if url.starts_with("/cdx?") {
+                    (
+                        200,
+                        format!(
+                            r#"[["urlkey","timestamp","original","mimetype","statuscode","digest","length"],["k","20150201000000","{base}/drifted","text/html","200","a","1"],["k","20150301000000","{base}/drifted","text/html","200","b","1"],["k","20140101000000","{base}/drifted","text/html","200","c","1"]]"#
+                        ),
+                    )
+                } else if url.starts_with("/archive/20150201000000id_/") {
+                    (
+                        200,
+                        "<p>Closest in time, but the sentence is not here.</p>".to_string(),
+                    )
+                } else if url.starts_with("/archive/20150301000000id_/") {
+                    (200, "<p>Old page: Anything in Existence that can be distinguished from anything else.</p>".to_string())
                 } else if url == "/changed" {
                     (200, "<p>Anything in Existence which can be distinguished from anything else.</p>".to_string())
                 } else if url.starts_with("/wayback/available") {
@@ -557,8 +791,87 @@ mod tests {
             lock: PathBuf::from("audit/sources.lock.json"),
             rate: Duration::from_millis(rate_ms),
             wayback: format!("{base}/wayback/available"),
+            cdx: format!("{base}/cdx"),
+            archive_web: format!("{base}/archive"),
+            archive_around: "20150101".into(),
             timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn fix_pins_a_verified_snapshot_beside_a_drifted_quote() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let quote = "Anything in Existence that can be distinguished from anything else.";
+        fs::write(
+            tmp.path().join("src/mind.md"),
+            node("Mind", &format!("{base}/drifted"), quote),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let pinned: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.check == "quote_missing" && f.term == "mind")
+            .collect();
+        assert_eq!(pinned.len(), 1, "{findings:?}");
+        let pin = format!("{base}/archive/20150301000000/{base}/drifted");
+        assert_eq!(
+            pinned[0].fix.as_deref(),
+            Some(format!("pin the archived copy {pin} beside the link").as_str())
+        );
+        assert!(pinned[0].fixed);
+        let mind = fs::read_to_string(tmp.path().join("src/mind.md")).unwrap();
+        assert!(
+            mind.contains(&format!(
+                "<a href=\"{base}/drifted\" target=\"_blank\">Mind (source)</a> <a href=\"{pin}\" target=\"_blank\">(archived 2015-03-01)</a>\n"
+            )),
+            "{mind}"
+        );
+        // The closest snapshot lacked the sentence and was skipped; the
+        // farthest was never needed.
+        let asked: Vec<String> = log.lock().unwrap().clone();
+        assert!(
+            asked
+                .iter()
+                .any(|u| u.starts_with("/archive/20150201000000id_/"))
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|u| u.starts_with("/archive/20140101000000id_/"))
+        );
+        let lock = sources::read_lock(&tmp.path().join("audit/sources.lock.json"))
+            .unwrap()
+            .unwrap();
+        let entry = &lock[&format!("{base}/drifted")];
+        assert_eq!(entry.archive.as_deref(), Some(pin.as_str()));
+        assert_eq!(entry.quotes["mind"], "archived");
+
+        // Second run: the pin in the node is read back, the snapshot is
+        // checked instead of searched for, and nothing is reported.
+        log.lock().unwrap().clear();
+        let again = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        assert!(again.iter().all(|f| f.term != "mind"), "{again:?}");
+        let asked: Vec<String> = log.lock().unwrap().clone();
+        assert!(!asked.iter().any(|u| u.starts_with("/cdx")));
+        assert!(
+            asked
+                .iter()
+                .any(|u| u.starts_with("/archive/20150301000000id_/"))
+        );
+        let mind_again = fs::read_to_string(tmp.path().join("src/mind.md")).unwrap();
+        assert_eq!(mind, mind_again, "the pin is written once");
+        assert_eq!(
+            snapshot_date("http://web.archive.org/web/20150623010707/http://a.org/x").as_deref(),
+            Some("2015-06-23")
+        );
+        assert_eq!(
+            raw_snapshot_url("https://web.archive.org/web/20150623010707/http://a.org/x"),
+            "https://web.archive.org/web/20150623010707id_/http://a.org/x"
+        );
     }
 
     #[test]

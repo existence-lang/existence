@@ -175,6 +175,19 @@ enum Commands {
         #[arg(long, value_name = "URL", default_value = commands::source_check::DEFAULT_WAYBACK)]
         wayback: String,
 
+        /// Wayback CDX endpoint --sources searches when a quoted passage has
+        /// left its page, to pin a snapshot that still carries it
+        #[arg(long, value_name = "URL", default_value = commands::source_check::DEFAULT_CDX)]
+        cdx: String,
+
+        /// Snapshot base for --sources: <URL>/<timestamp>/<page>
+        #[arg(long, value_name = "URL", default_value = commands::source_check::DEFAULT_ARCHIVE_WEB)]
+        archive_web: String,
+
+        /// Try snapshots nearest this date first when pinning (YYYYMMDD)
+        #[arg(long, value_name = "DATE", default_value = commands::source_check::DEFAULT_ARCHIVE_AROUND)]
+        archive_around: String,
+
         /// Report format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -352,6 +365,9 @@ fn main() {
             ref lock,
             rate_ms,
             ref wayback,
+            ref cdx,
+            ref archive_web,
+            ref archive_around,
             ref format,
             fix,
             ref output,
@@ -383,6 +399,9 @@ fn main() {
                 lock: lock.clone(),
                 rate: std::time::Duration::from_millis(rate_ms),
                 wayback: wayback.clone(),
+                cdx: cdx.clone(),
+                archive_web: archive_web.clone(),
+                archive_around: archive_around.clone(),
                 ..Default::default()
             };
             match commands::audit::run(

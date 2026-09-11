@@ -39,6 +39,11 @@ pub struct SourceRef {
     pub label: String,
     /// Quoted lines with the `>` prefix stripped, in document order.
     pub quotes: Vec<String>,
+    /// A Wayback snapshot pinned beside the anchor: a second anchor on the
+    /// same line whose URL is `…/<timestamp>/<this url>`. Quotes are verified
+    /// against it when the live page has moved on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
 }
 
 /// All sources of one node.
@@ -165,10 +170,14 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
                 // Inline shape: the passage follows the anchor on this line.
                 let mut last = None;
                 for cap in anchor.captures_iter(q) {
+                    if pin_previous(&mut refs, last, &cap[1]) {
+                        continue;
+                    }
                     refs.push(SourceRef {
                         url: cap[1].to_string(),
                         label: label_on_line(&label_re, q, &cap[1]),
                         quotes: Vec::new(),
+                        archive: None,
                     });
                     last = Some(refs.len() - 1);
                 }
@@ -199,6 +208,9 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
             // Standalone shape: quotes follow on later lines.
             let mut last = None;
             for cap in anchor.captures_iter(line) {
+                if pin_previous(&mut refs, last, &cap[1]) {
+                    continue;
+                }
                 let mut label = label_on_line(&label_re, line, &cap[1]);
                 if label.is_empty() && !line.contains("</a>") {
                     // Label wrapped onto the next line.
@@ -212,6 +224,7 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
                     url: cap[1].to_string(),
                     label,
                     quotes: Vec::new(),
+                    archive: None,
                 });
                 last = Some(refs.len() - 1);
             }
@@ -228,6 +241,37 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
         current = None;
     }
     refs
+}
+
+/// The page a Wayback-style URL (`…/<timestamp>[id_]/<url>`) is a copy of.
+pub fn archived_original(url: &str) -> Option<&str> {
+    let re = Regex::new(r"/(\d{4,14})(?:id_)?/(https?://.+)$").unwrap();
+    re.captures(url).map(|c| c.get(2).unwrap().as_str())
+}
+
+/// When `url` is an archived copy of the anchor just before it on the same
+/// line, record it as that source's pin instead of a source of its own.
+fn pin_previous(refs: &mut [SourceRef], last: Option<usize>, url: &str) -> bool {
+    let (Some(idx), Some(original)) = (last, archived_original(url)) else {
+        return false;
+    };
+    if same_page(&refs[idx].url, original) && refs[idx].archive.is_none() {
+        refs[idx].archive = Some(url.to_string());
+        return true;
+    }
+    false
+}
+
+/// Equal up to scheme and an explicit `:80`, which archives rewrite.
+fn same_page(a: &str, b: &str) -> bool {
+    let strip = |u: &str| {
+        u.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .replacen(":80/", "/", 1)
+            .trim_end_matches('/')
+            .to_string()
+    };
+    strip(a) == strip(b)
 }
 
 fn label_on_line(label_re: &Regex, line: &str, url: &str) -> String {
@@ -257,6 +301,10 @@ pub fn build_lock(all: &[TermSources], existing: Option<&Lock>) -> Lock {
             });
             if !entry.cited_by.contains(&ts.term) {
                 entry.cited_by.push(ts.term.clone());
+            }
+            // A pin written in the node outranks whatever a fetch recorded.
+            if src.archive.is_some() {
+                entry.archive = src.archive.clone();
             }
             entry.quotes.entry(ts.term.clone()).or_insert_with(|| {
                 existing
@@ -420,6 +468,40 @@ Scope is a pattern.
             ["Scope is the extent of the area or subject matter."]
         );
         assert_eq!(refs[4].quotes, ["from Italian scopo \"aim, purpose\"."]);
+    }
+
+    #[test]
+    fn an_archive_anchor_beside_its_source_pins_it_instead_of_being_a_source() {
+        let refs = extract_sources(
+            "# T\n\n<a href=\"http://x.org/a\" target=\"_blank\">A</a> <a href=\"https://web.archive.org/web/20150301000000/http://x.org/a\" target=\"_blank\">(archived 2015-03-01)</a>\n\n> kept\n\n> <a href=\"https://y.org/b\">B</a> <a href=\"http://127.0.0.1:9/archive/20150301000000id_/https://y.org/b\">(archived)</a>: inline passage\n\n<a href=\"https://web.archive.org/web/20100101000000/http://z.org/c\">C, a dead link already swapped</a>\n\n> c\n",
+        );
+        assert_eq!(refs.len(), 3, "{refs:?}");
+        assert_eq!(refs[0].url, "http://x.org/a");
+        assert_eq!(
+            refs[0].archive.as_deref(),
+            Some("https://web.archive.org/web/20150301000000/http://x.org/a")
+        );
+        assert_eq!(refs[0].quotes, vec!["kept"]);
+        assert_eq!(refs[1].url, "https://y.org/b");
+        assert!(refs[1].archive.is_some());
+        assert_eq!(refs[1].quotes, vec!["inline passage"]);
+        // With no live anchor before it, an archive URL is a source of its own.
+        assert!(refs[2].url.starts_with("https://web.archive.org/"));
+        assert!(refs[2].archive.is_none());
+        assert_eq!(
+            archived_original("https://web.archive.org/web/2015id_/http://x.org/a"),
+            Some("http://x.org/a")
+        );
+        assert_eq!(archived_original("http://x.org/a"), None);
+
+        let all = vec![TermSources {
+            term: "t".into(),
+            sources: refs,
+        }];
+        let lock = build_lock(&all, None);
+        assert_eq!(lock.len(), 3);
+        assert!(lock["http://x.org/a"].archive.is_some());
+        assert!(lock["https://y.org/b"].archive.is_some());
     }
 
     #[test]

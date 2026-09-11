@@ -192,6 +192,25 @@ URLs keeping their previous lock values. Dead links get a Wayback snapshot
 pinned through the availability API (`--wayback` to point at another
 endpoint), and `--fix` rewrites the citing node's `href` to that copy.
 
+A quote that has left a page that is still live is looked for in the past
+instead: the Wayback CDX index (`--cdx`) lists the page's snapshots, the ones
+nearest `--archive-around` (default `20150101`, when most nodes were written)
+are fetched first, and the first snapshot carrying every passage the ontology
+quotes from that page is pinned in the lock. `--fix` writes it beside the
+anchor as a second link on the same line:
+
+```html
+<a href="http://en.wiktionary.org/wiki/scope" target="_blank">scope (wiktionary)</a> <a href="https://web.archive.org/web/20150221114818/http://en.wiktionary.org/wiki/scope" target="_blank">(archived 2015-02-21)</a>
+```
+
+`sources` reads that pair as one source with a pin, not two sources; from
+then on a passage missing from the live page but present in the pinned copy
+is recorded as `archived` and not reported, and only a passage absent from
+both is an error. The live link stays for readers, the snapshot for the
+audit. At most six snapshots are tried per page; a page with none that still
+carries the quote is reported as `missing` with no fix, for a person to
+requote or replace.
+
 `--mirrors` checks the surfaces that copy the ontology, declared in
 `existence.toml`:
 
@@ -356,7 +375,7 @@ terms = ["project", "model", "algorithm", ...]
 upstream = "github:existence-lang/ontology"
 ```
 
-## Commands (v0.6.0)
+## Commands (v0.7.0)
 
 | Command | Description | Status |
 |---------|-------------|--------|
