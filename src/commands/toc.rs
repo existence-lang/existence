@@ -241,7 +241,9 @@ fn rebase_links(text: &str, base: &str, link_re: &Regex) -> String {
 
 /// The link prefix when `--base` is not given: relative path from the output
 /// file's directory to `src/`, or `src` for stdout (an index at the root).
-fn default_base(ontology_dir: &Path, output: Option<&Path>) -> String {
+/// The link prefix for an index written at `output`: the relative path from
+/// its directory to `src/`, or `src` for stdout.
+pub fn default_base(ontology_dir: &Path, output: Option<&Path>) -> String {
     let Some(out) = output else {
         return "src".to_string();
     };

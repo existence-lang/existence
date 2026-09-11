@@ -10,6 +10,22 @@ pub struct Config {
     pub rings: BTreeMap<String, Ring>,
     #[serde(default)]
     pub sources: BTreeMap<String, String>,
+    /// Surfaces that copy the ontology, checked by `existence audit --mirrors`.
+    #[serde(default)]
+    pub mirrors: Vec<Mirror>,
+}
+
+/// One `[[mirrors]]` entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Mirror {
+    /// `~/…`, absolute, or relative to the ontology directory.
+    pub path: String,
+    /// `nodes` (node-per-file copy), `toc` (generated index), or `table`
+    /// (`| **Term** | summary |` rows).
+    pub kind: String,
+    /// Skip silently when the path does not exist (a mirror on another machine).
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Debug, Deserialize)]

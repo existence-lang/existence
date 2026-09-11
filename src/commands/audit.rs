@@ -19,16 +19,21 @@
 //!   record status, page hash, and per-term quote presence, pin a Wayback
 //!   snapshot for dead links. Not run unless asked for.
 //!
+//! - `--mirrors`: the `[[mirrors]]` declared in `existence.toml` — per-term
+//!   lay-definition drift for node copies, stale generated indexes, table
+//!   rows that no longer summarise their node.
+//!
 //! `--fix` applies the safe resolutions only: appending `.md` to a
-//! suffix-less link whose target node exists, and replacing a dead link with
-//! its pinned archive copy. Everything else is a decision and stays reported.
+//! suffix-less link whose target node exists, replacing a dead link with its
+//! pinned archive copy, and regenerating `toc` mirrors. Everything else is a
+//! decision and stays reported.
 //!
 //! Exit status: 0 when there is no error-severity finding, 1 when there is,
 //! 2 when the audit could not run (the ontology is unreadable or its
 //! manifest does not parse). Warnings never fail the audit.
 
 use crate::commands::source_check::{self, SourceOptions};
-use crate::commands::{lint, toc};
+use crate::commands::{lint, mirrors, toc};
 use crate::config::Config;
 use crate::markdown;
 use regex::Regex;
@@ -81,6 +86,8 @@ pub struct Classes {
     pub contradictions: bool,
     /// Network: re-fetch every cited URL against the lockfile.
     pub sources: bool,
+    /// Declared mirrors of the ontology: per-term drift, stale generated indexes.
+    pub mirrors: bool,
 }
 
 impl Classes {
@@ -90,6 +97,7 @@ impl Classes {
             structure: true,
             contradictions: true,
             sources: true,
+            mirrors: true,
         }
     }
     /// The offline classes: what runs when no class flag is given.
@@ -98,10 +106,11 @@ impl Classes {
             structure: true,
             contradictions: true,
             sources: false,
+            mirrors: true,
         }
     }
     fn any(self) -> bool {
-        self.structure || self.contradictions || self.sources
+        self.structure || self.contradictions || self.sources || self.mirrors
     }
 }
 
@@ -174,6 +183,10 @@ pub fn build_with(
     if classes.sources {
         class_names.push("sources".to_string());
         findings.extend(source_check::check(ontology_dir, source_opts, fix)?);
+    }
+    if classes.mirrors {
+        class_names.push("mirrors".to_string());
+        findings.extend(mirrors::check(ontology_dir, &config, fix)?);
     }
 
     let summary = Summary {
@@ -712,7 +725,7 @@ mod tests {
         setup(tmp.path());
         let report = build(tmp.path(), Classes::offline(), false).unwrap();
         assert_eq!(report.ontology, "test/ontology");
-        assert_eq!(report.classes, ["structure", "contradictions"]);
+        assert_eq!(report.classes, ["structure", "contradictions", "mirrors"]);
         let c = checks(&report);
         let s = |a: &str, b: &str, d: &str| (a.to_string(), b.to_string(), d.to_string());
         assert!(c.contains(&s("link_suffix", "entity", "error")));
@@ -862,7 +875,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(
             written["classes"],
-            serde_json::json!(["structure", "contradictions"])
+            serde_json::json!(["structure", "contradictions", "mirrors"])
         );
         assert!(
             run(
@@ -929,6 +942,7 @@ mod tests {
             structure: false,
             contradictions: true,
             sources: false,
+            mirrors: false,
         };
         let report = build(tmp.path(), classes, false).unwrap();
         assert_eq!(report.classes, ["contradictions"]);

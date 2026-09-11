@@ -130,6 +130,12 @@ enum Commands {
         #[arg(long)]
         sources: bool,
 
+        /// Run the mirrors class: `[[mirrors]]` from existence.toml — per-term
+        /// drift of node copies, stale generated indexes (`--fix` regenerates),
+        /// table rows that no longer summarise their node
+        #[arg(long)]
+        mirrors: bool,
+
         /// Run every class, the network sources pass included
         #[arg(long)]
         all: bool,
@@ -313,6 +319,7 @@ fn main() {
             structure,
             contradictions,
             sources,
+            mirrors,
             all,
             ref lock,
             rate_ms,
@@ -329,6 +336,7 @@ fn main() {
                     structure,
                     contradictions,
                     sources,
+                    mirrors,
                 }
             };
             let source_opts = commands::source_check::SourceOptions {
