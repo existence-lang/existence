@@ -8,6 +8,7 @@ pub mod lookup;
 pub mod new;
 pub mod scope;
 pub mod search;
+pub mod source_check;
 pub mod sources;
 pub mod sparql;
 pub mod toc;

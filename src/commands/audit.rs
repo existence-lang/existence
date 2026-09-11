@@ -15,14 +15,19 @@
 //!   sentences side by side), and known terms mentioned in a lay definition
 //!   without a link. All report only.
 //!
-//! `--fix` applies the safe resolutions only: today that is appending `.md`
-//! to a suffix-less link whose target node exists. Everything else is a
-//! decision and stays reported.
+//! - `--sources` (network): re-fetch every URL in `audit/sources.lock.json`,
+//!   record status, page hash, and per-term quote presence, pin a Wayback
+//!   snapshot for dead links. Not run unless asked for.
+//!
+//! `--fix` applies the safe resolutions only: appending `.md` to a
+//! suffix-less link whose target node exists, and replacing a dead link with
+//! its pinned archive copy. Everything else is a decision and stays reported.
 //!
 //! Exit status: 0 when there is no error-severity finding, 1 when there is,
 //! 2 when the audit could not run (the ontology is unreadable or its
 //! manifest does not parse). Warnings never fail the audit.
 
+use crate::commands::source_check::{self, SourceOptions};
 use crate::commands::{lint, toc};
 use crate::config::Config;
 use crate::markdown;
@@ -74,18 +79,29 @@ pub struct Report {
 pub struct Classes {
     pub structure: bool,
     pub contradictions: bool,
+    /// Network: re-fetch every cited URL against the lockfile.
+    pub sources: bool,
 }
 
 impl Classes {
-    /// Every class this build implements.
+    /// Every class this build implements, including the network pass.
     pub fn all() -> Self {
         Classes {
             structure: true,
             contradictions: true,
+            sources: true,
+        }
+    }
+    /// The offline classes: what runs when no class flag is given.
+    pub fn offline() -> Self {
+        Classes {
+            structure: true,
+            contradictions: true,
+            sources: false,
         }
     }
     fn any(self) -> bool {
-        self.structure || self.contradictions
+        self.structure || self.contradictions || self.sources
     }
 }
 
@@ -100,13 +116,14 @@ pub fn run(
     format: &str,
     fix: bool,
     output: Option<&Path>,
+    source_opts: &SourceOptions,
 ) -> Result<bool, String> {
     let classes = if classes.any() {
         classes
     } else {
-        Classes::all()
+        Classes::offline()
     };
-    let report = build(ontology_dir, classes, fix)?;
+    let report = build_with(ontology_dir, classes, fix, source_opts)?;
     let text = match format {
         "json" => {
             let mut json = serde_json::to_string_pretty(&report)
@@ -130,8 +147,14 @@ pub fn run(
 }
 
 /// Build the report, applying safe fixes first when `fix` is set so the
-/// report describes the ontology as it is left.
-pub fn build(ontology_dir: &Path, classes: Classes, fix: bool) -> Result<Report, String> {
+/// report describes the ontology as it is left. `source_opts` only matters
+/// when `classes.sources` is set.
+pub fn build_with(
+    ontology_dir: &Path,
+    classes: Classes,
+    fix: bool,
+    source_opts: &SourceOptions,
+) -> Result<Report, String> {
     let src_dir = ontology_dir.join("src");
     if !src_dir.is_dir() {
         return Err(format!("Source directory {} not found", src_dir.display()));
@@ -147,6 +170,10 @@ pub fn build(ontology_dir: &Path, classes: Classes, fix: bool) -> Result<Report,
     if classes.contradictions {
         class_names.push("contradictions".to_string());
         findings.extend(contradictions(ontology_dir)?);
+    }
+    if classes.sources {
+        class_names.push("sources".to_string());
+        findings.extend(source_check::check(ontology_dir, source_opts, fix)?);
     }
 
     let summary = Summary {
@@ -623,6 +650,10 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn build(dir: &Path, classes: Classes, fix: bool) -> Result<Report, String> {
+        build_with(dir, classes, fix, &SourceOptions::default())
+    }
+
     fn node(title: &str, ontology: &str) -> String {
         format!(
             "# {title}\n\n## Ontology\n\n{ontology}\n\n## Axiology\n\nx\n\n## Epistemology\n\ny\n"
@@ -679,7 +710,7 @@ mod tests {
     fn structure_reports_every_check_class() {
         let tmp = tempfile::tempdir().unwrap();
         setup(tmp.path());
-        let report = build(tmp.path(), Classes::all(), false).unwrap();
+        let report = build(tmp.path(), Classes::offline(), false).unwrap();
         assert_eq!(report.ontology, "test/ontology");
         assert_eq!(report.classes, ["structure", "contradictions"]);
         let c = checks(&report);
@@ -722,7 +753,7 @@ mod tests {
     fn fix_appends_md_only_where_the_target_exists() {
         let tmp = tempfile::tempdir().unwrap();
         setup(tmp.path());
-        let report = build(tmp.path(), Classes::all(), true).unwrap();
+        let report = build(tmp.path(), Classes::offline(), true).unwrap();
         let entity = fs::read_to_string(tmp.path().join("src/entity.md")).unwrap();
         assert!(entity.contains("[signal](./signal.md \"broader\")"));
         assert!(entity.contains("[echo](./echo)"));
@@ -743,7 +774,7 @@ mod tests {
                 .any(|f| f.check == "lint" && f.term == "entity")
         );
         // A second pass finds only the unfixable link.
-        let again = build(tmp.path(), Classes::all(), false).unwrap();
+        let again = build(tmp.path(), Classes::offline(), false).unwrap();
         let links: Vec<&Finding> = again
             .findings
             .iter()
@@ -816,14 +847,34 @@ mod tests {
         );
         // `run` with no class flag runs every class and reports clean.
         let out = tmp.path().join("report.json");
-        assert!(run(tmp.path(), Classes::default(), "json", false, Some(&out)).unwrap());
+        assert!(
+            run(
+                tmp.path(),
+                Classes::default(),
+                "json",
+                false,
+                Some(&out),
+                &SourceOptions::default()
+            )
+            .unwrap()
+        );
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(
             written["classes"],
             serde_json::json!(["structure", "contradictions"])
         );
-        assert!(run(tmp.path(), Classes::all(), "yaml", false, None).is_err());
+        assert!(
+            run(
+                tmp.path(),
+                Classes::offline(),
+                "yaml",
+                false,
+                None,
+                &SourceOptions::default()
+            )
+            .is_err()
+        );
     }
 
     fn contra_setup(tmp: &Path) {
@@ -877,6 +928,7 @@ mod tests {
         let classes = Classes {
             structure: false,
             contradictions: true,
+            sources: false,
         };
         let report = build(tmp.path(), classes, false).unwrap();
         assert_eq!(report.classes, ["contradictions"]);

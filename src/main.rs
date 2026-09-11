@@ -124,6 +124,28 @@ enum Commands {
         #[arg(long)]
         contradictions: bool,
 
+        /// Run the sources class (network): re-fetch every URL in the lockfile,
+        /// compare status, page hash, and quoted passages, pin Wayback
+        /// snapshots for dead links. Never runs unless asked for
+        #[arg(long)]
+        sources: bool,
+
+        /// Run every class, the network sources pass included
+        #[arg(long)]
+        all: bool,
+
+        /// Lockfile for --sources (relative to the ontology)
+        #[arg(long, value_name = "PATH", default_value = commands::sources::DEFAULT_LOCK)]
+        lock: PathBuf,
+
+        /// Minimum milliseconds between --sources requests
+        #[arg(long, value_name = "MS", default_value_t = 1000)]
+        rate_ms: u64,
+
+        /// Wayback availability endpoint for --sources
+        #[arg(long, value_name = "URL", default_value = commands::source_check::DEFAULT_WAYBACK)]
+        wayback: String,
+
         /// Report format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -290,16 +312,39 @@ fn main() {
         Commands::Audit {
             structure,
             contradictions,
+            sources,
+            all,
+            ref lock,
+            rate_ms,
+            ref wayback,
             ref format,
             fix,
             ref output,
         } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
-            let classes = commands::audit::Classes {
-                structure,
-                contradictions,
+            let classes = if all {
+                commands::audit::Classes::all()
+            } else {
+                commands::audit::Classes {
+                    structure,
+                    contradictions,
+                    sources,
+                }
             };
-            match commands::audit::run(&ontology_dir, classes, format, fix, output.as_deref()) {
+            let source_opts = commands::source_check::SourceOptions {
+                lock: lock.clone(),
+                rate: std::time::Duration::from_millis(rate_ms),
+                wayback: wayback.clone(),
+                ..Default::default()
+            };
+            match commands::audit::run(
+                &ontology_dir,
+                classes,
+                format,
+                fix,
+                output.as_deref(),
+                &source_opts,
+            ) {
                 Ok(true) => Ok(()),
                 Ok(false) => process::exit(1),
                 Err(e) => {

@@ -178,8 +178,22 @@ pair reads as merge or keep.
 published); lay definitions that define each other (2- and 3-cycles in the
 graph of links that appear in first sentences only, reported with each
 sentence side by side); and known terms named in a lay definition that
-never links them. With no class flag every implemented class runs; later
-phases add `--sources`, `--mirrors`, and `--semantic`.
+never links them.
+
+`--sources` is the network class and never runs unless asked for. It
+re-fetches every URL in `audit/sources.lock.json` (one request per second,
+`--rate-ms` to change it, with a `User-Agent`), records the status, a SHA-256
+of the page's text, and per citing term whether each quoted passage is still
+there: `present`, `moved` (a window of the page matches at ≥ 0.9
+similarity), or `missing`. A dead link or a missing quote is an error, a
+moved quote a warning, a changed page with its quotes intact is only
+recorded. A host that cannot be reached is skipped with one warning, its
+URLs keeping their previous lock values. Dead links get a Wayback snapshot
+pinned through the availability API (`--wayback` to point at another
+endpoint), and `--fix` rewrites the citing node's `href` to that copy.
+
+With no class flag the offline classes run; `--all` adds the network
+pass. Later phases add `--mirrors` and `--semantic`.
 
 Each finding carries `class`, `check`, `severity` (`error` fails the audit,
 `warning` never does), `term`, `message`, `fix` (the safe resolution, when
@@ -307,7 +321,7 @@ upstream = "github:existence-lang/ontology"
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
 | `sources [term]` | External sources and quoted passages per node; `--lock` writes `audit/sources.lock.json` | Implemented |
-| `audit` | Structure/manifest + contradiction audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`, `--contradictions`) |
+| `audit` | Structure, contradiction, and source audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`, `--contradictions`, `--sources`) |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |
