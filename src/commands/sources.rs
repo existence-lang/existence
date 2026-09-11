@@ -39,11 +39,12 @@ pub struct SourceRef {
     pub label: String,
     /// Quoted lines with the `>` prefix stripped, in document order.
     pub quotes: Vec<String>,
-    /// A Wayback snapshot pinned beside the anchor: a second anchor on the
-    /// same line whose URL is `…/<timestamp>/<this url>`. Quotes are verified
-    /// against it when the live page has moved on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive: Option<String>,
+    /// Wayback snapshots pinned beside the anchor: further anchors on the
+    /// same line whose URL is `…/<timestamp>/<this url>`, in line order. A
+    /// quote the live page has lost is verified against them in turn; a
+    /// node whose quotes come from different years carries one per year.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub archives: Vec<String>,
 }
 
 /// All sources of one node.
@@ -65,10 +66,29 @@ pub struct LockEntry {
     /// SHA-256 of the normalised page text at the last fetch.
     pub content_sha256: Option<String>,
     /// Per citing term: `unchecked` until fetched, then `present`, `moved`,
-    /// or `missing`.
+    /// `archived` (lost from the live page, found in a pinned copy), or
+    /// `missing`.
     pub quotes: BTreeMap<String, String>,
-    /// Pinned Wayback snapshot URL.
-    pub archive: Option<String>,
+    /// Pinned Wayback snapshot URLs: the copies lost quotes are verified
+    /// against (the union over every citing node), or the copy a dead link
+    /// is swapped for. Older locks wrote one under `archive`.
+    #[serde(default, alias = "archive", deserialize_with = "one_or_many")]
+    pub archives: Vec<String>,
+}
+
+/// `null`, one URL, or a list, as a list.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(url)) => vec![url],
+        Some(OneOrMany::Many(urls)) => urls,
+    })
 }
 
 /// The lockfile: URL → entry, sorted by URL.
@@ -177,7 +197,7 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
                         url: cap[1].to_string(),
                         label: label_on_line(&label_re, q, &cap[1]),
                         quotes: Vec::new(),
-                        archive: None,
+                        archives: Vec::new(),
                     });
                     last = Some(refs.len() - 1);
                 }
@@ -224,7 +244,7 @@ pub fn extract_sources(content: &str) -> Vec<SourceRef> {
                     url: cap[1].to_string(),
                     label,
                     quotes: Vec::new(),
-                    archive: None,
+                    archives: Vec::new(),
                 });
                 last = Some(refs.len() - 1);
             }
@@ -250,20 +270,23 @@ pub fn archived_original(url: &str) -> Option<&str> {
 }
 
 /// When `url` is an archived copy of the anchor just before it on the same
-/// line, record it as that source's pin instead of a source of its own.
+/// line, record it as one of that source's pins instead of a source of its
+/// own.
 fn pin_previous(refs: &mut [SourceRef], last: Option<usize>, url: &str) -> bool {
     let (Some(idx), Some(original)) = (last, archived_original(url)) else {
         return false;
     };
-    if same_page(&refs[idx].url, original) && refs[idx].archive.is_none() {
-        refs[idx].archive = Some(url.to_string());
+    if same_page(&refs[idx].url, original) {
+        if !refs[idx].archives.iter().any(|a| a == url) {
+            refs[idx].archives.push(url.to_string());
+        }
         return true;
     }
     false
 }
 
 /// Equal up to scheme and an explicit `:80`, which archives rewrite.
-fn same_page(a: &str, b: &str) -> bool {
+pub fn same_page(a: &str, b: &str) -> bool {
     let strip = |u: &str| {
         u.trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -296,15 +319,17 @@ pub fn build_lock(all: &[TermSources], existing: Option<&Lock>) -> Lock {
                     status: prior.and_then(|p| p.status),
                     content_sha256: prior.and_then(|p| p.content_sha256.clone()),
                     quotes: BTreeMap::new(),
-                    archive: prior.and_then(|p| p.archive.clone()),
+                    archives: Vec::new(),
                 }
             });
             if !entry.cited_by.contains(&ts.term) {
                 entry.cited_by.push(ts.term.clone());
             }
-            // A pin written in the node outranks whatever a fetch recorded.
-            if src.archive.is_some() {
-                entry.archive = src.archive.clone();
+            // Pins written in nodes come first; what a fetch recorded follows.
+            for pin in &src.archives {
+                if !entry.archives.contains(pin) {
+                    entry.archives.push(pin.clone());
+                }
             }
             entry.quotes.entry(ts.term.clone()).or_insert_with(|| {
                 existing
@@ -314,8 +339,15 @@ pub fn build_lock(all: &[TermSources], existing: Option<&Lock>) -> Lock {
             });
         }
     }
-    for entry in lock.values_mut() {
+    for (url, entry) in lock.iter_mut() {
         entry.cited_by.sort();
+        if let Some(prior) = existing.and_then(|l| l.get(url)) {
+            for pin in &prior.archives {
+                if !entry.archives.contains(pin) {
+                    entry.archives.push(pin.clone());
+                }
+            }
+        }
     }
     lock
 }
@@ -478,16 +510,16 @@ Scope is a pattern.
         assert_eq!(refs.len(), 3, "{refs:?}");
         assert_eq!(refs[0].url, "http://x.org/a");
         assert_eq!(
-            refs[0].archive.as_deref(),
-            Some("https://web.archive.org/web/20150301000000/http://x.org/a")
+            refs[0].archives,
+            ["https://web.archive.org/web/20150301000000/http://x.org/a"]
         );
         assert_eq!(refs[0].quotes, vec!["kept"]);
         assert_eq!(refs[1].url, "https://y.org/b");
-        assert!(refs[1].archive.is_some());
+        assert_eq!(refs[1].archives.len(), 1);
         assert_eq!(refs[1].quotes, vec!["inline passage"]);
         // With no live anchor before it, an archive URL is a source of its own.
         assert!(refs[2].url.starts_with("https://web.archive.org/"));
-        assert!(refs[2].archive.is_none());
+        assert!(refs[2].archives.is_empty());
         assert_eq!(
             archived_original("https://web.archive.org/web/2015id_/http://x.org/a"),
             Some("http://x.org/a")
@@ -500,8 +532,21 @@ Scope is a pattern.
         }];
         let lock = build_lock(&all, None);
         assert_eq!(lock.len(), 3);
-        assert!(lock["http://x.org/a"].archive.is_some());
-        assert!(lock["https://y.org/b"].archive.is_some());
+        assert_eq!(lock["http://x.org/a"].archives.len(), 1);
+        assert_eq!(lock["https://y.org/b"].archives.len(), 1);
+
+        // Two pins on one line are both that source's, in line order.
+        let refs = extract_sources(
+            "# T\n\n<a href=\"http://x.org/a\" target=\"_blank\">A</a> <a href=\"https://web.archive.org/web/20150301000000/http://x.org/a\" target=\"_blank\">(archived 2015-03-01)</a> <a href=\"https://web.archive.org/web/20180101000000/http://x.org/a\" target=\"_blank\">(archived 2018-01-01)</a>\n\n> kept\n",
+        );
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(
+            refs[0].archives,
+            [
+                "https://web.archive.org/web/20150301000000/http://x.org/a",
+                "https://web.archive.org/web/20180101000000/http://x.org/a"
+            ]
+        );
     }
 
     #[test]
@@ -587,7 +632,7 @@ Scope is a pattern.
       "being": "unchecked",
       "entity": "unchecked"
     },
-    "archive": null
+    "archives": []
   },
   "https://en.wiktionary.org/wiki/being": {
     "cited_by": [
@@ -599,7 +644,7 @@ Scope is a pattern.
     "quotes": {
       "being": "unchecked"
     },
-    "archive": null
+    "archives": []
   }
 }
 "#;
@@ -623,7 +668,7 @@ Scope is a pattern.
                     ("entity".to_string(), "present".to_string()),
                     ("gone".to_string(), "missing".to_string()),
                 ]),
-                archive: Some("https://web.archive.org/web/2026/x".into()),
+                archives: vec!["https://web.archive.org/web/2026/x".into()],
             },
         );
         existing.insert(
@@ -634,7 +679,7 @@ Scope is a pattern.
                 status: Some(404),
                 content_sha256: None,
                 quotes: BTreeMap::new(),
-                archive: None,
+                archives: Vec::new(),
             },
         );
         let lock = build_lock(&all, Some(&existing));
@@ -644,10 +689,7 @@ Scope is a pattern.
         assert_eq!(entity.fetched_at.as_deref(), Some("2026-09-11T00:00:00Z"));
         assert_eq!(entity.status, Some(200));
         assert_eq!(entity.content_sha256.as_deref(), Some("abc"));
-        assert_eq!(
-            entity.archive.as_deref(),
-            Some("https://web.archive.org/web/2026/x")
-        );
+        assert_eq!(entity.archives, ["https://web.archive.org/web/2026/x"]);
         assert_eq!(entity.quotes["entity"], "present");
         assert_eq!(entity.quotes["being"], UNCHECKED);
         assert!(!entity.quotes.contains_key("gone"));

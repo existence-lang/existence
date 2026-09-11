@@ -142,7 +142,7 @@ listed with no quotes.
 
 `--lock` aggregates the same data by URL into the lockfile the audit will
 maintain: `cited_by` (terms citing the URL), `fetched_at`, `status`,
-`content_sha256`, `archive` (a pinned Wayback snapshot), and `quotes`, a
+`content_sha256`, `archives` (the pinned Wayback snapshots), and `quotes`, a
 per-term status. Listing never touches the network, so a new entry carries
 `fetched_at: null` and `quotes: { term: "unchecked" }`; rewriting the lock
 keeps the fetch results already recorded for URLs and terms that still cite,
@@ -193,23 +193,27 @@ pinned through the availability API (`--wayback` to point at another
 endpoint), and `--fix` rewrites the citing node's `href` to that copy.
 
 A quote that has left a page that is still live is looked for in the past
-instead: the Wayback CDX index (`--cdx`) lists the page's snapshots, the ones
+instead: the Wayback CDX index (`--cdx`) lists the page's snapshots, the six
 nearest `--archive-around` (default `20150101`, when most nodes were written)
-are fetched first, and the first snapshot carrying every passage the ontology
-quotes from that page is pinned in the lock. `--fix` writes it beside the
-anchor as a second link on the same line:
+are fetched first, and a snapshot carrying every passage the node has lost is
+pinned in the lock. `--fix` writes it beside the anchor as a second link on
+the same line:
 
 ```html
 <a href="http://en.wiktionary.org/wiki/scope" target="_blank">scope (wiktionary)</a> <a href="https://web.archive.org/web/20150221114818/http://en.wiktionary.org/wiki/scope" target="_blank">(archived 2015-02-21)</a>
 ```
 
 `sources` reads that pair as one source with a pin, not two sources; from
-then on a passage missing from the live page but present in the pinned copy
+then on a passage missing from the live page but present in a pinned copy
 is recorded as `archived` and not reported, and only a passage absent from
-both is an error. The live link stays for readers, the snapshot for the
-audit. At most six snapshots are tried per page; a page with none that still
-carries the quote is reported as `missing` with no fix, for a person to
-requote or replace.
+the live page and every pin is an error. Each passage is verified on its
+own, so a node whose quotes from one page were taken in different years
+carries one pin per year: when no snapshot in the nearest window carries
+every lost passage, the ones covering the most are pinned, then one snapshot
+per calendar year over the rest of the archive is tried for what is left,
+up to twenty fetches per search. Each node's line gets only the pins its own
+quotes need. A passage no snapshot carries is reported as `missing` with no
+fix, for a person to requote or replace.
 
 `--mirrors` checks the surfaces that copy the ontology, declared in
 `existence.toml`:
