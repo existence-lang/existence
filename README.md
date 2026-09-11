@@ -356,7 +356,7 @@ terms = ["project", "model", "algorithm", ...]
 upstream = "github:existence-lang/ontology"
 ```
 
-## Commands (v0.3.0)
+## Commands (v0.6.0)
 
 | Command | Description | Status |
 |---------|-------------|--------|
