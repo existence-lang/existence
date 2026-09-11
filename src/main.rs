@@ -119,6 +119,11 @@ enum Commands {
         #[arg(long)]
         structure: bool,
 
+        /// Run the contradictions class: broader-graph cycles, mutual lay
+        /// definitions, unlinked mentions of known terms (report only)
+        #[arg(long)]
+        contradictions: bool,
+
         /// Report format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -284,12 +289,16 @@ fn main() {
         }
         Commands::Audit {
             structure,
+            contradictions,
             ref format,
             fix,
             ref output,
         } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
-            let classes = commands::audit::Classes { structure };
+            let classes = commands::audit::Classes {
+                structure,
+                contradictions,
+            };
             match commands::audit::run(&ontology_dir, classes, format, fix, output.as_deref()) {
                 Ok(true) => Ok(()),
                 Ok(false) => process::exit(1),

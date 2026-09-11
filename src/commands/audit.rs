@@ -9,6 +9,12 @@
 //!   neither lint nor the link rebaser sees), and near-duplicate slugs
 //!   (`signal`/`signals`) scored by lay-definition similarity.
 //!
+//! - `--contradictions`: cycles in the broader graph after inverses (`A`
+//!   broader `B` and `B` broader `A`, or longer), mutual lay definitions
+//!   (`A`'s first sentence links `B` and `B`'s links `A`, reported with both
+//!   sentences side by side), and known terms mentioned in a lay definition
+//!   without a link. All report only.
+//!
 //! `--fix` applies the safe resolutions only: today that is appending `.md`
 //! to a suffix-less link whose target node exists. Everything else is a
 //! decision and stays reported.
@@ -22,7 +28,7 @@ use crate::config::Config;
 use crate::markdown;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// One audit finding.
@@ -67,15 +73,19 @@ pub struct Report {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Classes {
     pub structure: bool,
+    pub contradictions: bool,
 }
 
 impl Classes {
     /// Every class this build implements.
     pub fn all() -> Self {
-        Classes { structure: true }
+        Classes {
+            structure: true,
+            contradictions: true,
+        }
     }
     fn any(self) -> bool {
-        self.structure
+        self.structure || self.contradictions
     }
 }
 
@@ -133,6 +143,10 @@ pub fn build(ontology_dir: &Path, classes: Classes, fix: bool) -> Result<Report,
     if classes.structure {
         class_names.push("structure".to_string());
         findings.extend(structure(ontology_dir, fix)?);
+    }
+    if classes.contradictions {
+        class_names.push("contradictions".to_string());
+        findings.extend(contradictions(ontology_dir)?);
     }
 
     let summary = Summary {
@@ -193,8 +207,19 @@ fn finding(
     message: String,
     fix: Option<String>,
 ) -> Finding {
+    finding_in("structure", check, severity, term, message, fix)
+}
+
+fn finding_in(
+    class: &str,
+    check: &str,
+    severity: &str,
+    term: &str,
+    message: String,
+    fix: Option<String>,
+) -> Finding {
     Finding {
-        class: "structure".into(),
+        class: class.into(),
         check: check.into(),
         severity: severity.into(),
         term: term.into(),
@@ -356,6 +381,209 @@ fn definition_words(src_dir: &Path, term: &str) -> Result<BTreeSet<String>, Stri
         .collect())
 }
 
+/// The contradictions class: broader-graph cycles, mutual lay definitions,
+/// and unlinked mentions of known terms.
+fn contradictions(ontology_dir: &Path) -> Result<Vec<Finding>, String> {
+    let src_dir = ontology_dir.join("src");
+    let terms = markdown::list_terms(&src_dir)?;
+    let mut nodes: BTreeMap<String, NodeView> = BTreeMap::new();
+    for term in &terms {
+        let path = src_dir.join(format!("{term}.md"));
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let definition = markdown::extract_definition(&content).unwrap_or_default();
+        let definition_links: Vec<String> = markdown::extract_links(&definition)
+            .into_iter()
+            .filter(|t| t != term && terms.contains(t))
+            .collect();
+        nodes.insert(
+            term.clone(),
+            NodeView {
+                typed: markdown::extract_typed_links(&content),
+                definition,
+                definition_links,
+            },
+        );
+    }
+
+    let mut out = Vec::new();
+    out.extend(broader_cycles(&nodes));
+    out.extend(mutual_definitions(&nodes));
+    out.extend(unlinked_mentions(&nodes));
+    Ok(out)
+}
+
+struct NodeView {
+    typed: Vec<markdown::TypedLink>,
+    definition: String,
+    definition_links: Vec<String>,
+}
+
+/// Cycles in the broader graph, with `narrower` links inverted the way
+/// `export` does. Each cycle is reported once, from its smallest member.
+fn broader_cycles(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
+    let mut broader: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (term, node) in nodes {
+        for link in &node.typed {
+            if !nodes.contains_key(&link.term) {
+                continue;
+            }
+            match link.relation {
+                markdown::Relation::Broader => {
+                    broader.entry(term).or_default().insert(&link.term);
+                }
+                markdown::Relation::Narrower => {
+                    broader.entry(&link.term).or_default().insert(term);
+                }
+                markdown::Relation::Related => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for cycle in elementary_cycles(&broader) {
+        let path = cycle
+            .iter()
+            .chain(std::iter::once(&cycle[0]))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" → ");
+        out.push(finding_in(
+            "contradictions",
+            "broader_cycle",
+            "error",
+            &cycle[0],
+            format!("broader links form a cycle: {path}"),
+            None,
+        ));
+    }
+    out
+}
+
+/// Elementary cycles of a small directed graph, each rotated to start at its
+/// smallest node and listed once, sorted. Cycles are bounded to length 6.
+fn elementary_cycles(graph: &BTreeMap<&str, BTreeSet<&str>>) -> Vec<Vec<String>> {
+    let mut found: BTreeSet<Vec<String>> = BTreeSet::new();
+    for &start in graph.keys() {
+        let mut stack = vec![start];
+        walk(graph, start, start, &mut stack, &mut found);
+    }
+    found.into_iter().collect()
+}
+
+fn walk<'a>(
+    graph: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+    start: &'a str,
+    at: &'a str,
+    stack: &mut Vec<&'a str>,
+    found: &mut BTreeSet<Vec<String>>,
+) {
+    if stack.len() > 6 {
+        return;
+    }
+    let Some(next) = graph.get(at) else { return };
+    for &n in next {
+        if n == start {
+            // Only record the cycle from its smallest member so each is unique.
+            if stack.iter().all(|s| *s >= start) {
+                found.insert(stack.iter().map(|s| s.to_string()).collect());
+            }
+        } else if n > start && !stack.contains(&n) {
+            stack.push(n);
+            walk(graph, start, n, stack, found);
+            stack.pop();
+        }
+    }
+}
+
+/// Lay definitions that define each other: 2-cycles and 3-cycles in the
+/// graph of links that appear in first sentences only.
+fn mutual_definitions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
+    let graph: BTreeMap<&str, BTreeSet<&str>> = nodes
+        .iter()
+        .map(|(t, n)| {
+            (
+                t.as_str(),
+                n.definition_links.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let mut out = Vec::new();
+    for cycle in elementary_cycles(&graph) {
+        if cycle.len() > 3 {
+            continue;
+        }
+        let mut message = format!(
+            "lay definitions define each other in a cycle: {}",
+            cycle.join(" → ")
+        );
+        for term in &cycle {
+            message.push_str(&format!(
+                "\n  {term}: {}",
+                markdown::plain_text(&nodes[term].definition)
+            ));
+        }
+        out.push(finding_in(
+            "contradictions",
+            "mutual_definition",
+            "warning",
+            &cycle[0],
+            message,
+            None,
+        ));
+    }
+    out
+}
+
+/// Known terms named in a lay definition that never links them: a term
+/// linked once and then repeated in plain prose is ordinary writing, not a
+/// finding. Slugs are matched as whole words, hyphens as spaces, with an
+/// optional plural `s`; slugs shorter than four letters are skipped as too
+/// ambiguous (`art`, `god`).
+fn unlinked_mentions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
+    let link = Regex::new(r"\[[^\]]*\]\([^)]*\)").unwrap();
+    let mut out = Vec::new();
+    for (term, node) in nodes {
+        if node.definition.is_empty() {
+            continue;
+        }
+        let prose = link.replace_all(&node.definition, " ").to_lowercase();
+        let mut hits = Vec::new();
+        for other in nodes.keys() {
+            if other == term || other.len() < 4 || node.definition_links.contains(other) {
+                continue;
+            }
+            let word = regex::escape(&other.replace('-', " "));
+            let re = Regex::new(&format!(r"\b{word}(s|es)?\b")).unwrap();
+            if re.is_match(&prose) {
+                hits.push(other.as_str());
+            }
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        out.push(finding_in(
+            "contradictions",
+            "unlinked_mention",
+            "warning",
+            term,
+            format!(
+                "lay definition mentions {} without a link: {}",
+                if hits.len() == 1 {
+                    "a known term"
+                } else {
+                    "known terms"
+                },
+                hits.iter()
+                    .map(|h| format!("`{h}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None,
+        ));
+    }
+    out
+}
+
 /// Text rendering: one line per finding, then the summary.
 pub fn to_text(report: &Report) -> String {
     let mut out = String::new();
@@ -453,7 +681,7 @@ mod tests {
         setup(tmp.path());
         let report = build(tmp.path(), Classes::all(), false).unwrap();
         assert_eq!(report.ontology, "test/ontology");
-        assert_eq!(report.classes, ["structure"]);
+        assert_eq!(report.classes, ["structure", "contradictions"]);
         let c = checks(&report);
         let s = |a: &str, b: &str, d: &str| (a.to_string(), b.to_string(), d.to_string());
         assert!(c.contains(&s("link_suffix", "entity", "error")));
@@ -591,7 +819,118 @@ mod tests {
         assert!(run(tmp.path(), Classes::default(), "json", false, Some(&out)).unwrap());
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(written["classes"], serde_json::json!(["structure"]));
+        assert_eq!(
+            written["classes"],
+            serde_json::json!(["structure", "contradictions"])
+        );
         assert!(run(tmp.path(), Classes::all(), "yaml", false, None).is_err());
+    }
+
+    fn contra_setup(tmp: &Path) {
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            tmp.join("existence.toml"),
+            "[meta]\nname = \"t\"\ndescription = \"d\"\n\n[rings.0]\nname = \"k\"\ndescription = \"c\"\nterms = [\"entity\", \"information\", \"system\", \"scope\", \"domain\", \"focus\", \"story\"]\n",
+        )
+        .unwrap();
+        // Planted 2-cycle in lay definitions, plus an unlinked mention of `story`.
+        fs::write(
+            src.join("entity.md"),
+            node("Entity", "Any [information](./information.md) in a story."),
+        )
+        .unwrap();
+        fs::write(
+            src.join("information.md"),
+            node(
+                "Information",
+                "That which distinguishes; an [Entity](./entity.md).",
+            ),
+        )
+        .unwrap();
+        // Broader cycle: system broader scope, scope narrower system (inverse
+        // agrees), scope broader domain, domain broader system.
+        fs::write(
+            src.join("system.md"),
+            node("System", "A whole; see [scope](./scope.md \"broader\")."),
+        )
+        .unwrap();
+        fs::write(src.join("scope.md"), node("Scope", "Reach of a [system](./system.md \"narrower\") within a [domain](./domain.md \"broader\").")).unwrap();
+        fs::write(
+            src.join("domain.md"),
+            node("Domain", "A bounded [system](./system.md \"broader\")."),
+        )
+        .unwrap();
+        // Clean: links its terms, no cycle.
+        fs::write(
+            src.join("focus.md"),
+            node("Focus", "Attention on a [scope](./scope.md \"broader\")."),
+        )
+        .unwrap();
+        fs::write(src.join("story.md"), node("Story", "A sequence of events.")).unwrap();
+    }
+
+    #[test]
+    fn contradictions_catch_the_planted_cycles_and_mentions() {
+        let tmp = tempfile::tempdir().unwrap();
+        contra_setup(tmp.path());
+        let classes = Classes {
+            structure: false,
+            contradictions: true,
+        };
+        let report = build(tmp.path(), classes, false).unwrap();
+        assert_eq!(report.classes, ["contradictions"]);
+        let by_check = |c: &str| -> Vec<&Finding> {
+            report.findings.iter().filter(|f| f.check == c).collect()
+        };
+        let cycles = by_check("broader_cycle");
+        assert_eq!(cycles.len(), 1, "{cycles:?}");
+        assert_eq!(cycles[0].term, "domain");
+        assert_eq!(cycles[0].severity, "error");
+        assert_eq!(
+            cycles[0].message,
+            "broader links form a cycle: domain → system → scope → domain"
+        );
+        // The broader fixture's first sentences also link each other, so the
+        // lay-definition graph carries a 3-cycle and a 2-cycle of its own.
+        let mutual = by_check("mutual_definition");
+        let mutual_terms: Vec<&str> = mutual.iter().map(|f| f.term.as_str()).collect();
+        assert_eq!(mutual_terms, ["domain", "entity", "scope"], "{mutual:?}");
+        assert!(mutual[0].message.starts_with(
+            "lay definitions define each other in a cycle: domain → system → scope\n"
+        ));
+        assert_eq!(mutual[1].severity, "warning");
+        assert_eq!(
+            mutual[1].message,
+            "lay definitions define each other in a cycle: entity → information\n  entity: Any information in a story.\n  information: That which distinguishes; an Entity."
+        );
+        let mentions = by_check("unlinked_mention");
+        assert_eq!(mentions.len(), 1, "{mentions:?}");
+        assert_eq!(mentions[0].term, "entity");
+        assert_eq!(
+            mentions[0].message,
+            "lay definition mentions a known term without a link: `story`"
+        );
+        assert_eq!(report.summary.errors, 1);
+        assert_eq!(report.summary.warnings, 4);
+        assert!(!report.clean);
+    }
+
+    #[test]
+    fn elementary_cycles_are_unique_and_rotated_to_the_smallest_node() {
+        let mut g: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        g.insert("b", ["a"].into());
+        g.insert("a", ["b", "c"].into());
+        g.insert("c", ["a"].into());
+        g.insert("d", ["d"].into());
+        let cycles = elementary_cycles(&g);
+        assert_eq!(
+            cycles,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["a".to_string(), "c".to_string()],
+                vec!["d".to_string()],
+            ]
+        );
     }
 }

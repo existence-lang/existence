@@ -170,9 +170,16 @@ the `.md` suffix (`[environment](./environment)`), which lint does not count
 as links and the toc rebaser does not rewrite; and near-duplicate slugs
 (`signal`/`signals`, `agree`/`agreement`, `redefine`/`redefinition`), paired
 by shared stem and scored by the similarity of their lay definitions so the
-pair reads as merge or keep. With no class flag every implemented class
-runs; later phases add `--contradictions`, `--sources`, `--mirrors`, and
-`--semantic`.
+pair reads as merge or keep.
+
+`--contradictions` is report only: cycles in the broader graph after
+`"narrower"` links are inverted the way `export` does (`A` broader `B` and
+`B` broader `A`, or longer; an error, since the hierarchy cannot be
+published); lay definitions that define each other (2- and 3-cycles in the
+graph of links that appear in first sentences only, reported with each
+sentence side by side); and known terms named in a lay definition that
+never links them. With no class flag every implemented class runs; later
+phases add `--sources`, `--mirrors`, and `--semantic`.
 
 Each finding carries `class`, `check`, `severity` (`error` fails the audit,
 `warning` never does), `term`, `message`, `fix` (the safe resolution, when
@@ -300,7 +307,7 @@ upstream = "github:existence-lang/ontology"
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
 | `sources [term]` | External sources and quoted passages per node; `--lock` writes `audit/sources.lock.json` | Implemented |
-| `audit` | Structure/manifest audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`) |
+| `audit` | Structure/manifest + contradiction audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`, `--contradictions`) |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |
