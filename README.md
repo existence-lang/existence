@@ -87,6 +87,38 @@ Warnings (advisory — never fail the run; `###` subsections are non-normative):
 
 Exit code 0 if clean, 1 if errors found.
 
+### Term index
+
+```bash
+# Markdown index grouped by ring: one bullet per term with its lay definition
+existence toc
+
+# Write it to the repo root; term links point at src/<term>.md
+existence toc -o TERMS.md
+
+# Written elsewhere, links are rebased to the relative path back to src/;
+# --base overrides that (also for stdout, where it defaults to `src`)
+existence toc -o docs/terms.md
+existence toc --base https://example.org/ontology/src
+
+# One ring, or JSON for a site generator / context pack
+existence toc --ring 0
+existence toc --format json
+
+# Fail when the index would degrade: an Ontology section that does not open
+# with a plain sentence, a ring term with no node file, a node in no ring
+existence toc --check
+```
+
+Each bullet is `- [**Title**](path) — lay definition` (SPEC rule 2: the first
+line of the Ontology section), under a `## Ring N — name` heading with the
+ring's description from `existence.toml`. Node links inside a definition
+(`[return](./return.md)`) are rewritten to `<base>/return.md` so they stay
+live. Terms in `src/` that no ring declares are listed under `## Unringed`,
+and ring terms without a file are marked missing, so the index doubles as a
+manifest check. JSON carries both the slug (`term`, what `lookup` takes) and
+the `title`, plus `definition` (markdown) and `definition_text` (plain).
+
 ### Generate relationship graph
 
 ```bash
@@ -206,6 +238,7 @@ upstream = "github:existence-lang/ontology"
 | `scope [ring]` | List terms at a ring level | Implemented |
 | `lint [path]` | Validate nodes against SPEC.md rules | Implemented |
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
+| `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |

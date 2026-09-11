@@ -84,6 +84,33 @@ enum Commands {
         base_iri: Option<String>,
     },
 
+    /// Emit a term index with lay definitions, grouped by ring
+    Toc {
+        /// Output format: "markdown" (default) or "json"
+        #[arg(long, default_value = "markdown")]
+        format: String,
+
+        /// Filter to a specific ring level
+        #[arg(long)]
+        ring: Option<u32>,
+
+        /// Path prefix for term links (rewrites `./term.md` to `<base>/term.md`).
+        /// Defaults to the path from the output file's directory to src/, or
+        /// `src` when printing to stdout
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Write to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Emit nothing; fail when a node's Ontology section does not open
+        /// with a plain sentence, a ring lists a term with no node file, or
+        /// a node is in no ring
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Run a SPARQL query over the exported ontology (needs the `sparql` feature)
     Sparql {
         /// The query text, or `-` to read it from stdin. skos:, rdfs:, dcterms:,
@@ -189,6 +216,23 @@ fn main() {
         } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
             commands::export::run(&ontology_dir, ring, format, base_iri.as_deref())
+        }
+        Commands::Toc {
+            ref format,
+            ring,
+            ref base,
+            ref output,
+            check,
+        } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            commands::toc::run(
+                &ontology_dir,
+                ring,
+                format,
+                base.as_deref(),
+                output.as_deref(),
+                check,
+            )
         }
         Commands::New {
             ref term,

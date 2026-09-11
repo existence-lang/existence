@@ -37,7 +37,7 @@ impl Node {
 }
 
 /// Extract the title from `# Title` at start of file.
-fn extract_title(content: &str) -> Option<String> {
+pub fn extract_title(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("# ") && !trimmed.starts_with("## ") {

@@ -8,3 +8,4 @@ pub mod new;
 pub mod scope;
 pub mod search;
 pub mod sparql;
+pub mod toc;
