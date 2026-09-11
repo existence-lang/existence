@@ -106,7 +106,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Idempotent: a version already on crates.io (published by hand, or a
+      # re-run of this workflow) is a no-op, not a failure.
       - name: Publish to crates.io
-        run: cargo publish --locked
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl -fsS -A "existence-release (+https://github.com/existence-lang/existence)" \
+               "https://crates.io/api/v1/crates/existence/$version" | grep -q "\"num\":\"$version\""; then
+            echo "existence $version is already on crates.io; nothing to publish"
+            exit 0
+          fi
+          cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
