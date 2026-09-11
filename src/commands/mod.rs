@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod completions;
 pub mod export;
 pub mod fetch;

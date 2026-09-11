@@ -148,6 +148,37 @@ per-term status. Listing never touches the network, so a new entry carries
 keeps the fetch results already recorded for URLs and terms that still cite,
 and drops entries nothing cites any more.
 
+### Audit
+
+```bash
+# Structure and manifest checks, as text; exit 0 clean, 1 findings, 2 could not run
+existence audit --structure
+
+# The report JSON is the interface; text is a view of it
+existence audit --format json
+existence audit --format json -o audit/report.json
+
+# Apply the safe resolutions first (today: append `.md` to a suffix-less link
+# whose target node exists), then report what is left
+existence audit --fix
+```
+
+`--structure` wraps `lint` (errors and warnings) and `toc --check` (lay
+definition opens with a plain sentence, ring terms with no node file, nodes
+in no ring), and adds two checks neither of those sees: node links that miss
+the `.md` suffix (`[environment](./environment)`), which lint does not count
+as links and the toc rebaser does not rewrite; and near-duplicate slugs
+(`signal`/`signals`, `agree`/`agreement`, `redefine`/`redefinition`), paired
+by shared stem and scored by the similarity of their lay definitions so the
+pair reads as merge or keep. With no class flag every implemented class
+runs; later phases add `--contradictions`, `--sources`, `--mirrors`, and
+`--semantic`.
+
+Each finding carries `class`, `check`, `severity` (`error` fails the audit,
+`warning` never does), `term`, `message`, `fix` (the safe resolution, when
+one exists), and `fixed`. `--fix` applies only the mechanical resolutions;
+manifest membership, duplicates, and lint errors stay reported as decisions.
+
 ### Generate relationship graph
 
 ```bash
@@ -269,6 +300,7 @@ upstream = "github:existence-lang/ontology"
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
 | `sources [term]` | External sources and quoted passages per node; `--lock` writes `audit/sources.lock.json` | Implemented |
+| `audit` | Structure/manifest audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`) |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |

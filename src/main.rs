@@ -111,6 +111,28 @@ enum Commands {
         check: bool,
     },
 
+    /// Audit the ontology: structure and manifest checks, reported as text or
+    /// JSON; exit 0 clean, 1 findings, 2 could not run
+    Audit {
+        /// Run the structure class: lint, `toc --check`, links missing the
+        /// `.md` suffix, near-duplicate slugs (the default when no class is given)
+        #[arg(long)]
+        structure: bool,
+
+        /// Report format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Apply the safe resolutions (today: append `.md` to a suffix-less
+        /// link whose target node exists) before reporting
+        #[arg(long)]
+        fix: bool,
+
+        /// Write the report to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
     /// List the external sources each node cites and the passages it quotes,
     /// or derive the audit lockfile from them
     Sources {
@@ -259,6 +281,23 @@ fn main() {
         } => {
             let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
             commands::new::run(&ontology_dir, term, ring, no_edit, description.as_deref())
+        }
+        Commands::Audit {
+            structure,
+            ref format,
+            fix,
+            ref output,
+        } => {
+            let ontology_dir = resolve_or_exit(cli.ontology.as_deref());
+            let classes = commands::audit::Classes { structure };
+            match commands::audit::run(&ontology_dir, classes, format, fix, output.as_deref()) {
+                Ok(true) => Ok(()),
+                Ok(false) => process::exit(1),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(2);
+                }
+            }
         }
         Commands::Sources {
             ref term,

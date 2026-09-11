@@ -2,10 +2,11 @@ use crate::markdown;
 use std::path::Path;
 
 /// Lint result for a single node file.
-struct LintResult {
-    file: String,
-    errors: Vec<String>,
-    warnings: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintResult {
+    pub file: String,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Findings for one node: errors fail the run, warnings are advisory.
@@ -13,6 +14,49 @@ struct LintResult {
 struct LintFindings {
     errors: Vec<String>,
     warnings: Vec<String>,
+}
+
+/// Lint every node under `src_dir` and return the files with findings, in
+/// path order. This is the data `run` prints and `audit --structure` wraps.
+pub fn collect(src_dir: &Path) -> Result<Vec<LintResult>, String> {
+    if !src_dir.is_dir() {
+        return Err(format!("Source directory {} not found", src_dir.display()));
+    }
+    let existing_terms = markdown::list_terms(src_dir)?;
+    let mut results = Vec::new();
+
+    let mut entries: Vec<_> = std::fs::read_dir(src_dir)
+        .map_err(|e| format!("Cannot read {}: {e}", src_dir.display()))?
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "md")
+        })
+        .collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let findings = lint_content(&content, &filename, &existing_terms);
+        if !findings.errors.is_empty() || !findings.warnings.is_empty() {
+            results.push(LintResult {
+                file: filename,
+                errors: findings.errors,
+                warnings: findings.warnings,
+            });
+        }
+    }
+    Ok(results)
 }
 
 /// The recognized `###` subsection vocabulary per `##` section, as
@@ -61,44 +105,7 @@ pub fn run(ontology_dir: &Path, path: Option<&str>) -> Result<(), String> {
         None => ontology_dir.join("src"),
     };
 
-    if !src_dir.is_dir() {
-        return Err(format!("Source directory {} not found", src_dir.display()));
-    }
-
-    let existing_terms = markdown::list_terms(&src_dir)?;
-    let mut results = Vec::new();
-
-    let mut entries: Vec<_> = std::fs::read_dir(&src_dir)
-        .map_err(|e| format!("Cannot read {}: {e}", src_dir.display()))?
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext == "md")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.path());
-
-    for entry in entries {
-        let path = entry.path();
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let filename = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let findings = lint_content(&content, &filename, &existing_terms);
-        if !findings.errors.is_empty() || !findings.warnings.is_empty() {
-            results.push(LintResult {
-                file: filename,
-                errors: findings.errors,
-                warnings: findings.warnings,
-            });
-        }
-    }
+    let results = collect(&src_dir)?;
 
     let mut total_errors = 0;
     let mut total_warnings = 0;
