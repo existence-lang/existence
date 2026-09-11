@@ -218,8 +218,27 @@ byte for byte; `--fix` rewrites it. A `table` mirror is report only: a row
 whose term has no node, or whose summary shares too few words with the
 node's lay definition, is listed with both texts.
 
+`--semantic` hands an LLM each node's lay definition together with the lay
+definitions of the nodes its Ontology section links, and asks for a
+contradiction verdict with the two conflicting sentences quoted. Report
+only; it costs money and needs `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`
+with `--provider openai`), so it never runs on the PR path and is not part
+of `--all`. Verdicts are cached in `audit/semantic.cache.json` under a hash
+of the provider, model, prompt, and every definition involved, so a rerun on
+an unchanged ontology makes zero model calls and a weekly run re-judges
+only the nodes whose neighbourhood changed. `--model` picks the model
+(default `claude-opus-5`), `--limit N` caps the number of uncached nodes
+judged in one run, `--endpoint` points at another API host.
+
+```bash
+existence audit --semantic                    # judges every node once
+existence audit --semantic                    # zero model calls: all cached
+existence audit --semantic --limit 10         # budget a first pass
+existence audit --semantic --provider openai --model gpt-5
+```
+
 With no class flag the offline classes run; `--all` adds the network
-pass. The last phase adds `--semantic`.
+pass.
 
 Each finding carries `class`, `check`, `severity` (`error` fails the audit,
 `warning` never does), `term`, `message`, `fix` (the safe resolution, when
@@ -347,7 +366,7 @@ upstream = "github:existence-lang/ontology"
 | `graph [ring]` | Generate term relationship graph (DOT/JSON) | Implemented |
 | `toc` | Term index with lay definitions, grouped by ring (Markdown/JSON) | Implemented |
 | `sources [term]` | External sources and quoted passages per node; `--lock` writes `audit/sources.lock.json` | Implemented |
-| `audit` | Structure, contradiction, source, and mirror audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`, `--contradictions`, `--sources`, `--mirrors`) |
+| `audit` | Structure, contradiction, source, mirror, and LLM-semantic audit as text or JSON; `--fix` applies safe resolutions; exit 0/1/2 | Implemented (`--structure`, `--contradictions`, `--sources`, `--mirrors`, `--semantic`) |
 | `export [ring]` | Export the ontology as SKOS RDF (Turtle/JSON-LD) | Implemented |
 | `sparql <query>` | Run a SPARQL query over the exported ontology | Implemented (`--features sparql`) |
 | `serve` | SPARQL Protocol endpoint on localhost | Implemented (`--features sparql`) |

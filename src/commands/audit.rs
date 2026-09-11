@@ -23,6 +23,11 @@
 //!   lay-definition drift for node copies, stale generated indexes, table
 //!   rows that no longer summarise their node.
 //!
+//! - `--semantic` (paid, needs a key): an LLM judges each lay definition
+//!   against the lay definitions of the nodes it links; verdicts are cached
+//!   by content hash so an unchanged ontology makes zero model calls. Report
+//!   only, never on the PR path, never part of `--all`.
+//!
 //! `--fix` applies the safe resolutions only: appending `.md` to a
 //! suffix-less link whose target node exists, replacing a dead link with its
 //! pinned archive copy, and regenerating `toc` mirrors. Everything else is a
@@ -32,6 +37,7 @@
 //! 2 when the audit could not run (the ontology is unreadable or its
 //! manifest does not parse). Warnings never fail the audit.
 
+use crate::commands::semantic::{self, SemanticOptions};
 use crate::commands::source_check::{self, SourceOptions};
 use crate::commands::{lint, mirrors, toc};
 use crate::config::Config;
@@ -88,6 +94,9 @@ pub struct Classes {
     pub sources: bool,
     /// Declared mirrors of the ontology: per-term drift, stale generated indexes.
     pub mirrors: bool,
+    /// Paid: an LLM judges each lay definition against its linked neighbours.
+    /// Never part of `all()` or `offline()`; only `--semantic` selects it.
+    pub semantic: bool,
 }
 
 impl Classes {
@@ -98,6 +107,7 @@ impl Classes {
             contradictions: true,
             sources: true,
             mirrors: true,
+            semantic: false,
         }
     }
     /// The offline classes: what runs when no class flag is given.
@@ -107,10 +117,11 @@ impl Classes {
             contradictions: true,
             sources: false,
             mirrors: true,
+            semantic: false,
         }
     }
     fn any(self) -> bool {
-        self.structure || self.contradictions || self.sources || self.mirrors
+        self.structure || self.contradictions || self.sources || self.mirrors || self.semantic
     }
 }
 
@@ -126,13 +137,14 @@ pub fn run(
     fix: bool,
     output: Option<&Path>,
     source_opts: &SourceOptions,
+    semantic_opts: &SemanticOptions,
 ) -> Result<bool, String> {
     let classes = if classes.any() {
         classes
     } else {
         Classes::offline()
     };
-    let report = build_with(ontology_dir, classes, fix, source_opts)?;
+    let report = build_with(ontology_dir, classes, fix, source_opts, semantic_opts)?;
     let text = match format {
         "json" => {
             let mut json = serde_json::to_string_pretty(&report)
@@ -163,6 +175,7 @@ pub fn build_with(
     classes: Classes,
     fix: bool,
     source_opts: &SourceOptions,
+    semantic_opts: &SemanticOptions,
 ) -> Result<Report, String> {
     let src_dir = ontology_dir.join("src");
     if !src_dir.is_dir() {
@@ -187,6 +200,10 @@ pub fn build_with(
     if classes.mirrors {
         class_names.push("mirrors".to_string());
         findings.extend(mirrors::check(ontology_dir, &config, fix)?);
+    }
+    if classes.semantic {
+        class_names.push("semantic".to_string());
+        findings.extend(semantic::check(ontology_dir, semantic_opts)?);
     }
 
     let summary = Summary {
@@ -664,7 +681,13 @@ mod tests {
     use std::fs;
 
     fn build(dir: &Path, classes: Classes, fix: bool) -> Result<Report, String> {
-        build_with(dir, classes, fix, &SourceOptions::default())
+        build_with(
+            dir,
+            classes,
+            fix,
+            &SourceOptions::default(),
+            &SemanticOptions::default(),
+        )
     }
 
     fn node(title: &str, ontology: &str) -> String {
@@ -867,7 +890,8 @@ mod tests {
                 "json",
                 false,
                 Some(&out),
-                &SourceOptions::default()
+                &SourceOptions::default(),
+                &SemanticOptions::default()
             )
             .unwrap()
         );
@@ -884,7 +908,8 @@ mod tests {
                 "yaml",
                 false,
                 None,
-                &SourceOptions::default()
+                &SourceOptions::default(),
+                &SemanticOptions::default()
             )
             .is_err()
         );
@@ -943,6 +968,7 @@ mod tests {
             contradictions: true,
             sources: false,
             mirrors: false,
+            semantic: false,
         };
         let report = build(tmp.path(), classes, false).unwrap();
         assert_eq!(report.classes, ["contradictions"]);

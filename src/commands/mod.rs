@@ -9,6 +9,7 @@ pub mod mirrors;
 pub mod new;
 pub mod scope;
 pub mod search;
+pub mod semantic;
 pub mod source_check;
 pub mod sources;
 pub mod sparql;

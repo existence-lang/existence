@@ -136,9 +136,32 @@ enum Commands {
         #[arg(long)]
         mirrors: bool,
 
-        /// Run every class, the network sources pass included
+        /// Run every class, the network sources pass included (not --semantic)
         #[arg(long)]
         all: bool,
+
+        /// Run the semantic class (paid, needs ANTHROPIC_API_KEY or
+        /// OPENAI_API_KEY): an LLM judges each lay definition against the
+        /// definitions it links; verdicts cached by content hash in
+        /// audit/semantic.cache.json. Report only, never on the PR path
+        #[arg(long)]
+        semantic: bool,
+
+        /// Model provider for --semantic: anthropic (default) or openai
+        #[arg(long, value_name = "NAME", default_value = "anthropic")]
+        provider: String,
+
+        /// Model id for --semantic (default: claude-opus-5, or gpt-5 for openai)
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+
+        /// API base URL override for --semantic (tests, proxies)
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+
+        /// Judge at most this many not-yet-cached nodes with --semantic
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
 
         /// Lockfile for --sources (relative to the ontology)
         #[arg(long, value_name = "PATH", default_value = commands::sources::DEFAULT_LOCK)]
@@ -321,6 +344,11 @@ fn main() {
             sources,
             mirrors,
             all,
+            semantic,
+            ref provider,
+            ref model,
+            ref endpoint,
+            limit,
             ref lock,
             rate_ms,
             ref wayback,
@@ -337,7 +365,19 @@ fn main() {
                     contradictions,
                     sources,
                     mirrors,
+                    semantic,
                 }
+            };
+            let classes = commands::audit::Classes {
+                semantic: semantic || classes.semantic,
+                ..classes
+            };
+            let semantic_opts = commands::semantic::SemanticOptions {
+                provider: provider.clone(),
+                model: model.clone(),
+                endpoint: endpoint.clone(),
+                limit,
+                ..Default::default()
             };
             let source_opts = commands::source_check::SourceOptions {
                 lock: lock.clone(),
@@ -352,6 +392,7 @@ fn main() {
                 fix,
                 output.as_deref(),
                 &source_opts,
+                &semantic_opts,
             ) {
                 Ok(true) => Ok(()),
                 Ok(false) => process::exit(1),
