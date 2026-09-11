@@ -292,6 +292,9 @@ impl Client {
                 )
             })?,
         };
+        if let Some(reason) = key_shape_problem(&opts.provider, &key) {
+            return Err(format!("{env} {reason}"));
+        }
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(opts.timeout))
@@ -432,6 +435,27 @@ impl Client {
             .unwrap_or("")
             .to_string())
     }
+}
+
+/// Why `key` cannot be an API key for `provider`, decided before any request.
+///
+/// The Anthropic Messages API only accepts Console keys (`sk-ant-api...`).
+/// A Claude OAuth access token (`sk-ant-oat...`) is what `claude login`
+/// stores; the server answers it with `401 API key is invalid`, which reads
+/// like a stale key when the real problem is the kind of credential.
+pub fn key_shape_problem(provider: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Some("is empty".to_string());
+    }
+    if provider == "anthropic" && key.starts_with("sk-ant-oat") {
+        return Some(
+            "holds a Claude OAuth access token (sk-ant-oat...), not a Console API key \
+             (sk-ant-api...); create one at https://console.anthropic.com/settings/keys"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// The first `{ … }` object in a model reply, tolerant of prose around it.
@@ -706,6 +730,29 @@ mod tests {
             run(tmp.path(), &o)
                 .unwrap_err()
                 .contains("unknown provider")
+        );
+    }
+
+    #[test]
+    fn an_oauth_token_is_refused_before_any_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        // Nothing listens on this port: a request would surface as a
+        // transport error, so a shape error proves nothing was sent.
+        let o = SemanticOptions {
+            api_key: Some("sk-ant-oat01-abcdef".into()),
+            ..opts("http://127.0.0.1:1", "anthropic")
+        };
+        let err = run(tmp.path(), &o).unwrap_err();
+        assert!(
+            err.starts_with("ANTHROPIC_API_KEY holds a Claude OAuth access token"),
+            "{err}"
+        );
+        assert!(key_shape_problem("openai", "sk-ant-oat01-x").is_none());
+        assert!(key_shape_problem("anthropic", "sk-ant-api03-x").is_none());
+        assert_eq!(
+            key_shape_problem("anthropic", "  ").as_deref(),
+            Some("is empty")
         );
     }
 
