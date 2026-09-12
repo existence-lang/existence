@@ -13,6 +13,33 @@ pub struct Config {
     /// Surfaces that copy the ontology, checked by `existence audit --mirrors`.
     #[serde(default)]
     pub mirrors: Vec<Mirror>,
+    /// Review decisions the audit should remember between runs.
+    #[serde(default)]
+    pub audit: Audit,
+}
+
+/// `[audit]` — decisions a person already made, so the audit stops asking.
+#[derive(Debug, Default, Deserialize)]
+pub struct Audit {
+    /// Mentions reviewed and deliberately left unlinked.
+    #[serde(default)]
+    pub keep_unlinked: Vec<KeepUnlinked>,
+}
+
+/// One `[[audit.keep_unlinked]]` entry: a mention of `mention` in the lay
+/// definition of `term` that a person decided must stay unlinked.
+///
+/// `reason` has no default on purpose. The entry exists to record a judgement,
+/// and an exemption with no stated reason is indistinguishable from silencing
+/// the check, so omitting it is a parse error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeepUnlinked {
+    /// The node whose lay definition holds the mention.
+    pub term: String,
+    /// The term named in that definition and left unlinked.
+    pub mention: String,
+    /// Why it stays unlinked.
+    pub reason: String,
 }
 
 /// One `[[mirrors]]` entry.

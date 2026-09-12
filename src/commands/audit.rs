@@ -40,7 +40,7 @@
 use crate::commands::semantic::{self, SemanticOptions};
 use crate::commands::source_check::{self, SourceOptions};
 use crate::commands::{lint, mirrors, toc};
-use crate::config::Config;
+use crate::config::{Config, KeepUnlinked};
 use crate::markdown;
 use regex::Regex;
 use serde::Serialize;
@@ -191,7 +191,7 @@ pub fn build_with(
     }
     if classes.contradictions {
         class_names.push("contradictions".to_string());
-        findings.extend(contradictions(ontology_dir)?);
+        findings.extend(contradictions(ontology_dir, &config)?);
     }
     if classes.sources {
         class_names.push("sources".to_string());
@@ -454,7 +454,7 @@ fn definition_words(src_dir: &Path, term: &str) -> Result<BTreeSet<String>, Stri
 
 /// The contradictions class: broader-graph cycles, mutual lay definitions,
 /// and unlinked mentions of known terms.
-fn contradictions(ontology_dir: &Path) -> Result<Vec<Finding>, String> {
+fn contradictions(ontology_dir: &Path, config: &Config) -> Result<Vec<Finding>, String> {
     let src_dir = ontology_dir.join("src");
     let terms = markdown::list_terms(&src_dir)?;
     let mut nodes: BTreeMap<String, NodeView> = BTreeMap::new();
@@ -480,7 +480,7 @@ fn contradictions(ontology_dir: &Path) -> Result<Vec<Finding>, String> {
     let mut out = Vec::new();
     out.extend(broader_cycles(&nodes));
     out.extend(mutual_definitions(&nodes));
-    out.extend(unlinked_mentions(&nodes));
+    out.extend(unlinked_mentions(&nodes, &config.audit.keep_unlinked));
     Ok(out)
 }
 
@@ -610,8 +610,23 @@ fn mutual_definitions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
 /// finding. Slugs are matched as whole words, hyphens as spaces, with an
 /// optional plural `s`; slugs shorter than four letters are skipped as too
 /// ambiguous (`art`, `god`).
-fn unlinked_mentions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
+///
+/// Some mentions are reviewed and deliberately left unlinked — ordinary
+/// English in a borrowed sentence, a node naming itself, a link that would
+/// recreate a mutual-definition cycle. Those are recorded as
+/// `[[audit.keep_unlinked]]` entries in `existence.toml` and skipped here, so
+/// a resolved finding stops reappearing every run; a report whose entries are
+/// all already-settled questions teaches the reader to skip it.
+///
+/// An entry that no longer matches anything is reported as `stale_keep`. That
+/// is what keeps the list honest: without it the file would accumulate
+/// exemptions for mentions that have since been linked or rewritten, and an
+/// allow list nobody prunes is a way to silence the check rather than a record
+/// of decisions. It also catches a typo, since a misspelled term or mention
+/// matches nothing.
+fn unlinked_mentions(nodes: &BTreeMap<String, NodeView>, keeps: &[KeepUnlinked]) -> Vec<Finding> {
     let link = Regex::new(r"\[[^\]]*\]\([^)]*\)").unwrap();
+    let mut used: BTreeSet<(&str, &str)> = BTreeSet::new();
     let mut out = Vec::new();
     for (term, node) in nodes {
         if node.definition.is_empty() {
@@ -625,8 +640,17 @@ fn unlinked_mentions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
             }
             let word = regex::escape(&other.replace('-', " "));
             let re = Regex::new(&format!(r"\b{word}(s|es)?\b")).unwrap();
-            if re.is_match(&prose) {
-                hits.push(other.as_str());
+            if !re.is_match(&prose) {
+                continue;
+            }
+            match keeps
+                .iter()
+                .find(|k| k.term == *term && k.mention == *other)
+            {
+                Some(keep) => {
+                    used.insert((keep.term.as_str(), keep.mention.as_str()));
+                }
+                None => hits.push(other.as_str()),
             }
         }
         if hits.is_empty() {
@@ -648,6 +672,22 @@ fn unlinked_mentions(nodes: &BTreeMap<String, NodeView>) -> Vec<Finding> {
                     .map(|h| format!("`{h}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            None,
+        ));
+    }
+    for keep in keeps {
+        if used.contains(&(keep.term.as_str(), keep.mention.as_str())) {
+            continue;
+        }
+        out.push(finding_in(
+            "contradictions",
+            "stale_keep",
+            "warning",
+            &keep.term,
+            format!(
+                "audit.keep_unlinked keeps `{}` unlinked in the lay definition of `{}` ({}), but nothing there mentions it unlinked any more — drop the entry",
+                keep.mention, keep.term, keep.reason
             ),
             None,
         ));
@@ -1066,6 +1106,100 @@ mod tests {
         assert_eq!(report.summary.errors, 1);
         assert_eq!(report.summary.warnings, 4);
         assert!(!report.clean);
+    }
+
+    /// Append `[[audit.keep_unlinked]]` entries to the contradictions fixture.
+    fn with_keeps(tmp: &Path, toml: &str) {
+        let path = tmp.join("existence.toml");
+        let mut content = fs::read_to_string(&path).unwrap();
+        content.push_str(toml);
+        fs::write(&path, content).unwrap();
+    }
+
+    fn contra_report(tmp: &Path) -> Result<Report, String> {
+        build(
+            tmp,
+            Classes {
+                structure: false,
+                contradictions: true,
+                sources: false,
+                mirrors: false,
+                semantic: false,
+            },
+            false,
+        )
+    }
+
+    /// The fixture's one unlinked mention is `story` in `entity`. Recording it
+    /// as a deliberate keep must drop the finding and report nothing in its
+    /// place.
+    #[test]
+    fn a_kept_mention_is_not_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        contra_setup(tmp.path());
+        with_keeps(
+            tmp.path(),
+            "\n[[audit.keep_unlinked]]\nterm = \"entity\"\nmention = \"story\"\nreason = \"ordinary English here\"\n",
+        );
+        let report = contra_report(tmp.path()).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == "unlinked_mention" || f.check == "stale_keep"),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    /// An entry that no longer matches anything is what turns the list from a
+    /// record of decisions into a way to silence the check, so it is reported.
+    /// A typo lands here too: `focus` is a node, but `entity` never names it.
+    #[test]
+    fn a_keep_that_matches_nothing_is_reported_as_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        contra_setup(tmp.path());
+        with_keeps(
+            tmp.path(),
+            "\n[[audit.keep_unlinked]]\nterm = \"entity\"\nmention = \"focus\"\nreason = \"a typo for story\"\n",
+        );
+        let report = contra_report(tmp.path()).unwrap();
+        let stale: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.check == "stale_keep")
+            .collect();
+        assert_eq!(stale.len(), 1, "{stale:#?}");
+        assert_eq!(stale[0].term, "entity");
+        assert_eq!(stale[0].severity, "warning");
+        assert!(
+            stale[0].message.contains("`focus`") && stale[0].message.contains("a typo for story"),
+            "{}",
+            stale[0].message
+        );
+        // The real mention is still reported: a stale entry exempts nothing.
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.check == "unlinked_mention" && f.term == "entity"),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    /// An exemption with no stated reason cannot be told apart from silencing
+    /// the check, so `reason` has no default and omitting it fails the parse.
+    #[test]
+    fn a_keep_without_a_reason_is_a_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        contra_setup(tmp.path());
+        with_keeps(
+            tmp.path(),
+            "\n[[audit.keep_unlinked]]\nterm = \"entity\"\nmention = \"story\"\n",
+        );
+        let err = contra_report(tmp.path()).unwrap_err();
+        assert!(err.contains("reason"), "{err}");
     }
 
     #[test]

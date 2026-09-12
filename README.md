@@ -183,6 +183,26 @@ graph of links that appear in first sentences only, reported with each
 sentence side by side); and known terms named in a lay definition that
 never links them.
 
+Some of those mentions are reviewed and deliberately left unlinked —
+ordinary English in a borrowed sentence, a node naming itself, a link that
+would recreate a mutual-definition cycle. Record the decision and the audit
+stops asking:
+
+```toml
+[[audit.keep_unlinked]]
+term = "type"
+mention = "science"
+reason = "ordinary English in a borrowed sentence, not the node"
+```
+
+`reason` has no default: an exemption with no stated reason cannot be told
+apart from silencing the check, so omitting it fails the parse. An entry that
+no longer matches anything — the mention was linked, the sentence rewritten,
+the term misspelled — is reported as `stale_keep`, so the list stays a record
+of decisions rather than a drawer of forgotten exemptions. Both matter for the
+same reason the keeps do: a report whose entries are all already-settled
+questions teaches its reader to skip it.
+
 `--sources` is the network class and never runs unless asked for. It
 re-fetches every URL in `audit/sources.lock.json` (one request per second,
 `--rate-ms` to change it, with a `User-Agent`), records the status, a SHA-256
