@@ -355,11 +355,22 @@ pub fn fix_suffixless_links(content: &str, existing: &BTreeSet<String>) -> Strin
         .into_owned()
 }
 
+/// How much of the two lay definitions must overlap before a slug pair is
+/// called a duplicate. A shared stem alone proves nothing in a philosophy
+/// ontology, which deliberately separates a verb from its noun (`exist` /
+/// `existence`, `redefine` / `redefinition`) and an adjective from the thing
+/// (`abstract` / `abstraction`): those score 0.00-0.03 here, while the three
+/// pairs that really were one node copied twice scored 1.00. Below this the
+/// pair is evidence of nothing and reporting it every run is noise that
+/// trains the reader to ignore the check.
+const NEAR_DUPLICATE_MIN_SIMILARITY: f64 = 0.25;
+
 /// Slug pairs that share a stem once one inflectional or derivational
 /// suffix is stripped (`signal`/`signals`, `agree`/`agreement`,
-/// `redefine`/`redefinition`). Hyphenated compounds are skipped. Report
-/// only, with the Jaccard similarity of the two lay definitions so the pair
-/// reads as merge or keep.
+/// `redefine`/`redefinition`) **and** whose lay definitions overlap by at
+/// least [`NEAR_DUPLICATE_MIN_SIMILARITY`]. Hyphenated compounds are
+/// skipped. Report only, carrying the Jaccard similarity of the two lay
+/// definitions so the pair reads as merge or keep.
 fn near_duplicates(src_dir: &Path) -> Result<Vec<Finding>, String> {
     let terms = markdown::list_terms(src_dir)?;
     let simple: Vec<&String> = terms.iter().filter(|t| !t.contains('-')).collect();
@@ -377,6 +388,9 @@ fn near_duplicates(src_dir: &Path) -> Result<Vec<Finding>, String> {
             } else {
                 da.intersection(&db).count() as f64 / union as f64
             };
+            if score < NEAR_DUPLICATE_MIN_SIMILARITY {
+                continue;
+            }
             out.push(finding(
                 "near_duplicate",
                 "warning",
@@ -829,6 +843,52 @@ mod tests {
             fix_suffixless_links(text, &existing),
             "[a](./scope.md) [b](./scope.md#top) [c](./entity.md \"narrower\") [d](./gone) [e](./scope.md)"
         );
+    }
+
+    #[test]
+    fn near_duplicate_needs_definition_overlap_not_just_a_shared_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            tmp.path().join("existence.toml"),
+            "[meta]\nname = \"test/ontology\"\ndescription = \"d\"\n\n             [rings.0]\nname = \"kernel\"\ndescription = \"core\"\n             terms = [\"exist\", \"existence\", \"human\", \"humans\"]\n",
+        )
+        .unwrap();
+        // Shared stem, disjoint lay definitions: the verb and the universal
+        // set are separate terms on purpose, so the pair must stay silent.
+        fs::write(
+            src.join("exist.md"),
+            node("Exist", "To hold a place within reality."),
+        )
+        .unwrap();
+        fs::write(
+            src.join("existence.md"),
+            node("Existence", "Everything that is; the universal set."),
+        )
+        .unwrap();
+        // Shared stem and the same definition byte for byte: a real duplicate.
+        let dupe = node("Human", "A member of the species Homo sapiens.");
+        fs::write(src.join("human.md"), &dupe).unwrap();
+        fs::write(src.join("humans.md"), &dupe).unwrap();
+
+        let report = build(tmp.path(), Classes::offline(), false).unwrap();
+        let dups: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.check == "near_duplicate")
+            .collect();
+        assert_eq!(dups.len(), 1, "{dups:#?}");
+        assert_eq!(dups[0].term, "human");
+        assert!(
+            dups[0]
+                .message
+                .contains("look like the same term (definition similarity 1.00)"),
+            "{}",
+            dups[0].message
+        );
+        // `near` still pairs the suppressed slugs; only the report is quiet.
+        assert!(near("exist", "existence"));
     }
 
     #[test]

@@ -168,9 +168,12 @@ definition opens with a plain sentence, ring terms with no node file, nodes
 in no ring), and adds two checks neither of those sees: node links that miss
 the `.md` suffix (`[environment](./environment)`), which lint does not count
 as links and the toc rebaser does not rewrite; and near-duplicate slugs
-(`signal`/`signals`, `agree`/`agreement`, `redefine`/`redefinition`), paired
-by shared stem and scored by the similarity of their lay definitions so the
-pair reads as merge or keep.
+(`signal`/`signals`, `agree`/`agreement`), paired by shared stem and reported
+only when their lay definitions also overlap by at least 0.25 Jaccard, with
+that score in the message so the pair reads as merge or keep. A shared stem
+alone is not a duplicate: a philosophy ontology separates a verb from its
+noun on purpose (`exist`/`existence`, `redefine`/`redefinition`,
+`abstract`/`abstraction` all score 0.00-0.03), so those stay silent.
 
 `--contradictions` is report only: cycles in the broader graph after
 `"narrower"` links are inverted the way `export` does (`A` broader `B` and
