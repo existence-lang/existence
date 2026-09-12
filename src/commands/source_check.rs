@@ -838,8 +838,18 @@ fn best_window_similarity(page: &str, quote: &str) -> f64 {
     best
 }
 
-/// Lowercase, letters and digits only, single spaces.
+/// Lowercase, letters and digits only, single spaces. Wikipedia-style
+/// reference markers (`[1]`, `[a]`, `[note 2]`, `[citation needed]`) are
+/// dropped first, on the page and on the quote alike: a marker sits inside
+/// a sentence, so leaving it in makes a passage that is otherwise verbatim
+/// look absent, and a quote copied with its markers never matches a copy
+/// whose markers differ.
 pub fn normalise(text: &str) -> String {
+    let marker = Regex::new(
+        r"(?i)\[\s*(?:\d{1,3}|[a-z]{1,2}|note \d{1,3}|citation needed|clarification needed|dubious|verification needed|(?:when|who|which|where|why)\?)\s*\]",
+    )
+    .unwrap();
+    let text = marker.replace_all(text, " ");
     let mut out = String::with_capacity(text.len());
     let mut space = true;
     for c in text.chars() {
@@ -859,8 +869,13 @@ pub fn normalise(text: &str) -> String {
 pub fn html_to_text(html: &str) -> String {
     let block =
         Regex::new(r"(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)\s*>").unwrap();
+    // MediaWiki renders a citation as `<sup class="reference">…</sup>`
+    // inside the sentence it annotates; it is not part of the passage.
+    let reference =
+        Regex::new(r#"(?is)<sup[^>]*class="[^"]*\breference\b[^"]*"[^>]*>.*?</sup\s*>"#).unwrap();
     let tag = Regex::new(r"(?s)<[^>]+>").unwrap();
     let text = block.replace_all(html, " ");
+    let text = reference.replace_all(&text, " ");
     let text = tag.replace_all(&text, " ");
     let text = text
         .replace("&nbsp;", " ")
@@ -943,6 +958,38 @@ mod tests {
             "missing"
         );
         assert_eq!(match_quote(&page, ""), "present");
+    }
+
+    /// A citation marker inside the sentence — rendered as a reference
+    /// superscript, or copied into the quote as `[1]` — is not part of the
+    /// passage: a quote that is otherwise verbatim still counts as present.
+    #[test]
+    fn citation_markers_do_not_hide_a_verbatim_passage() {
+        let html = r##"<p>Technology (from Greek <i>techne</i>, "art"; and -logia<sup id="cite_ref-1" class="reference"><a href="#cite_note-1">[1]</a></sup>) is the collection of tools used by humans.<sup class="noprint Inline-Template">[<i>citation needed</i>]</sup> It occurs in eukaryotes.[2][3] Prokaryotes reproduce asexually.[note 4][a]</p>"##;
+        let page = normalise(&html_to_text(html));
+        assert_eq!(
+            page,
+            "technology from greek techne art and logia is the collection of tools used by humans it occurs in eukaryotes prokaryotes reproduce asexually"
+        );
+        assert_eq!(
+            match_quote(
+                &page,
+                r#"Technology (from Greek techne, "art"; and -logia) is the collection of tools used by humans."#
+            ),
+            "present"
+        );
+        assert_eq!(
+            match_quote(
+                &page,
+                "It occurs in eukaryotes.[1][2] Prokaryotes reproduce asexually."
+            ),
+            "present"
+        );
+        // A bracketed year or a long bracketed phrase is text, not a marker.
+        assert_eq!(
+            normalise("Born [1964] in [the same town]"),
+            "born 1964 in the same town"
+        );
     }
 
     #[test]
