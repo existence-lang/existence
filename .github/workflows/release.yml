@@ -3,12 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Run by hand to publish every tagged version crates.io is missing. Tags are
+  # normally published as they are pushed, but a spell of rejected credentials
+  # leaves a hole that no single re-run closes: four versions were tagged and
+  # released on GitHub while crates.io stayed on 0.7.0, and each one would have
+  # needed its own re-run of its own old workflow.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +81,7 @@ jobs:
           path: existence-${{ matrix.target }}.*
 
   release:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -99,6 +107,7 @@ jobs:
           fi
 
   publish:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -106,16 +115,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Idempotent: a version already on crates.io (published by hand, or a
-      # re-run of this workflow) is a no-op, not a failure.
       - name: Publish to crates.io
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          if curl -fsS -A "existence-release (+https://github.com/existence-lang/existence)" \
-               "https://crates.io/api/v1/crates/existence/$version" | grep -q "\"num\":\"$version\""; then
-            echo "existence $version is already on crates.io; nothing to publish"
-            exit 0
-          fi
-          cargo publish --locked
+        run: .github/scripts/publish-crate.sh "${GITHUB_REF_NAME#v}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # The tag-driven job above only ever sees the tag being pushed, so fixing a
+  # rejected token publishes the NEXT release and leaves the skipped ones behind.
+  # This walks every tag in version order and publishes the ones crates.io does
+  # not have; the already-there check makes re-running it free.
+  backfill:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish every version crates.io is missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Older tags predate this script, so keep a copy outside the worktree.
+          publish="$RUNNER_TEMP/publish-crate.sh"
+          cp .github/scripts/publish-crate.sh "$publish"
+          for tag in $(git tag --list 'v*' --sort=version:refname); do
+            echo "::group::$tag"
+            git checkout --quiet --detach "$tag"
+            "$publish" "${tag#v}"
+            echo "::endgroup::"
+          done
