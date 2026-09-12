@@ -236,6 +236,7 @@ path = "~/.claude/CLAUDE.md" # a `| **Term** | summary |` table
 kind = "table"
 optional = true
 compare = "paraphrase"       # default; "wording" also scores each row against its node
+rings = [0]                  # this table is exactly ring 0; check coverage too
 ```
 
 A `nodes` mirror is reported as a per-term diff of lay definitions with the
@@ -253,6 +254,20 @@ which is the failure that silently rots a mirror when a term is renamed or
 removed. Set `compare = "wording"` for a table meant to quote the ontology;
 it additionally scores each row against its node's lay definition and lists
 both texts when the overlap falls below 0.25.
+
+`compare` only judges the rows that are there, so a table whose rows all pass
+can still be wrong by omission: a new kernel term that never gets a row rots
+the mirror silently. `rings` closes that. It is a completeness claim —
+`rings = [0]` asserts the table's rows are exactly the terms of ring 0 — and
+it is checked both ways: a declared-ring term with no row is reported as
+`mirror_coverage`, a row naming a term outside the declared rings as
+`mirror_extra_row`. Several levels mean their union, so `rings = [0, 1]`
+wants a row for every term of either ring and accepts a row from either. A
+table that is deliberately a partial copy omits `rings` and keeps the
+row-names-a-node check alone; there is no way to claim part of a ring,
+because a claim that permits arbitrary omission detects nothing. Naming an
+undeclared level, or setting `rings` on a `nodes` or `toc` mirror, is a
+config error.
 
 `--semantic` hands an LLM each node's lay definition together with the lay
 definitions of the nodes its Ontology section links, and asks for a

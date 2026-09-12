@@ -17,6 +17,7 @@
 //! kind = "table"
 //! optional = true
 //! compare = "paraphrase"       # default; "wording" also scores row vs node text
+//! rings = [0]                  # this table is exactly ring 0; check coverage too
 //! ```
 //!
 //! `nodes` mirrors are reported as a per-term diff of lay definitions with
@@ -33,6 +34,23 @@
 //! renamed or removed. `compare = "wording"` additionally scores each row
 //! against its node's lay definition and lists both texts below
 //! [`TABLE_THRESHOLD`]; choose it for a table meant to quote the ontology.
+//!
+//! `compare` only ever judges the rows that are there, so a table whose rows
+//! all pass can still be wrong by omission: a new kernel term that never gets
+//! a row rots the mirror silently. `rings` closes that. It is a completeness
+//! claim — `rings = [0]` asserts the table's rows are exactly the terms of
+//! ring 0 — and it is checked in both directions: a declared-ring term with no
+//! row is `mirror_coverage`, a row naming a term outside the declared rings is
+//! `mirror_extra_row`. Several levels mean their union (`rings = [0, 1]`:
+//! every term of either ring needs a row, and every row must name one of
+//! them); union is the only reading that composes, since ring term lists are
+//! disjoint. A table that is deliberately a partial copy simply omits `rings`
+//! and keeps the row-names-a-node check alone — there is deliberately no way
+//! to claim part of a ring, because a claim that permits arbitrary omission
+//! detects nothing, which is the hole this key exists to close. Declaring an
+//! unknown level, or `rings` on a `nodes` or `toc` mirror, is a config error:
+//! `toc` mirrors are regenerated whole and `nodes` mirrors deliberately
+//! tolerate extra files.
 
 use crate::commands::audit::Finding;
 use crate::commands::toc;
@@ -56,6 +74,23 @@ pub fn check(ontology_dir: &Path, config: &Config, fix: bool) -> Result<Vec<Find
                 mirror.path, mirror.compare
             ));
         }
+        if !mirror.rings.is_empty() {
+            if mirror.kind != "table" {
+                return Err(format!(
+                    "mirror {}: rings is only meaningful on a table mirror, not '{}'",
+                    mirror.path, mirror.kind
+                ));
+            }
+            // A typo here would silently claim coverage of nothing.
+            for level in &mirror.rings {
+                if config.get_ring(*level).is_none() {
+                    return Err(format!(
+                        "mirror {}: rings names ring {level}, which is not declared in existence.toml",
+                        mirror.path
+                    ));
+                }
+            }
+        }
         let path = resolve(ontology_dir, &mirror.path)?;
         // A generated index that does not exist yet is stale, not missing:
         // `--fix` creates it.
@@ -74,7 +109,7 @@ pub fn check(ontology_dir: &Path, config: &Config, fix: bool) -> Result<Vec<Find
         match mirror.kind.as_str() {
             "nodes" => out.extend(nodes_mirror(ontology_dir, mirror, &path)?),
             "toc" => out.extend(toc_mirror(ontology_dir, mirror, &path, fix)?),
-            "table" => out.extend(table_mirror(ontology_dir, mirror, &path)?),
+            "table" => out.extend(table_mirror(ontology_dir, config, mirror, &path)?),
             other => {
                 return Err(format!(
                     "mirror {}: unknown kind '{other}' (expected nodes, toc, or table)",
@@ -213,12 +248,27 @@ fn toc_mirror(
     Ok(vec![f])
 }
 
-/// A `| **Term** | summary |` table: rows without a node, and — only when
-/// `compare = "wording"` — rows whose summary shares too few words with the
-/// node's lay definition. See the module docs for why wording is opt-in.
-fn table_mirror(ontology_dir: &Path, mirror: &Mirror, file: &Path) -> Result<Vec<Finding>, String> {
+/// A `| **Term** | summary |` table: rows without a node, rows whose summary
+/// shares too few words with the node's lay definition (only when
+/// `compare = "wording"`), and — when the mirror declares `rings` — the
+/// coverage of that claim in both directions. See the module docs for why
+/// wording is opt-in and what a `rings` claim means.
+fn table_mirror(
+    ontology_dir: &Path,
+    config: &Config,
+    mirror: &Mirror,
+    file: &Path,
+) -> Result<Vec<Finding>, String> {
     let src_dir = ontology_dir.join("src");
     let row = Regex::new(r"^\|\s*\*\*([^*|]+)\*\*\s*\|\s*(.*?)\s*\|\s*$").unwrap();
+    // The union of the declared rings, empty when the table claims nothing.
+    let claimed: BTreeSet<String> = mirror
+        .rings
+        .iter()
+        .filter_map(|level| config.get_ring(*level))
+        .flat_map(|ring| ring.terms.iter().cloned())
+        .collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for line in read(file)?.lines() {
         let Some(cap) = row.captures(line) else {
@@ -227,6 +277,7 @@ fn table_mirror(ontology_dir: &Path, mirror: &Mirror, file: &Path) -> Result<Vec
         let title = cap[1].trim();
         let summary = cap[2].trim();
         let term = title.to_lowercase().replace(' ', "-");
+        seen.insert(term.clone());
         let node = src_dir.join(format!("{term}.md"));
         if !node.is_file() {
             out.push(finding(
@@ -256,6 +307,40 @@ fn table_mirror(ontology_dir: &Path, mirror: &Mirror, file: &Path) -> Result<Vec
                 &term,
                 format!(
                     "table row **{title}** in {} shares few words with the node's lay definition (overlap {score:.2})\n  node:  {definition}\n  table: {summary}",
+                    mirror.path
+                ),
+                None,
+            ));
+        }
+    }
+    if !mirror.rings.is_empty() {
+        let levels = mirror
+            .rings
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A declared term with no row: the omission this claim exists to catch.
+        for term in claimed.difference(&seen) {
+            out.push(finding(
+                "mirror_coverage",
+                "warning",
+                term,
+                format!(
+                    "{} claims ring {levels} but has no row for **{term}**",
+                    mirror.path
+                ),
+                None,
+            ));
+        }
+        // A row outside them: the table grew past what it says it mirrors.
+        for term in seen.difference(&claimed) {
+            out.push(finding(
+                "mirror_extra_row",
+                "warning",
+                term,
+                format!(
+                    "table row **{term}** in {} is outside the claimed ring {levels}",
                     mirror.path
                 ),
                 None,
@@ -402,6 +487,117 @@ mod tests {
             assert_eq!(table[0].term, "ghost");
             assert!(table[0].message.contains("has no node"));
         }
+    }
+
+    /// Append `rings = ...` to the fixture's table mirror entry.
+    fn with_rings(onto: &Path, value: &str) -> Config {
+        let toml_path = onto.join("existence.toml");
+        let toml = fs::read_to_string(&toml_path).unwrap().replace(
+            "kind = \"table\"\ncompare",
+            &format!("kind = \"table\"\nrings = {value}\ncompare"),
+        );
+        fs::write(&toml_path, toml).unwrap();
+        Config::load(&toml_path).unwrap()
+    }
+
+    /// The fixture's ring 0 is existence, entity, scope, state, domain; its
+    /// table has rows for Entity, Scope and Ghost. Claiming ring 0 must report
+    /// the three terms with no row and the one row outside the ring.
+    #[test]
+    fn a_rings_claim_is_checked_in_both_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        let config = with_rings(&onto, "[0]");
+        let found: Vec<(String, String)> = check(&onto, &config, false)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.check == "mirror_coverage" || f.check == "mirror_extra_row")
+            .map(|f| (f.check, f.term))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("mirror_coverage".to_string(), "domain".to_string()),
+                ("mirror_coverage".to_string(), "existence".to_string()),
+                ("mirror_coverage".to_string(), "state".to_string()),
+                ("mirror_extra_row".to_string(), "ghost".to_string()),
+            ]
+        );
+    }
+
+    /// The claim is what turns coverage on: a table that declares no rings is
+    /// a deliberate partial copy and must keep only the row-names-a-node check.
+    #[test]
+    fn without_a_rings_claim_coverage_is_not_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, config) = setup(tmp.path());
+        assert!(
+            !check(&onto, &config, false)
+                .unwrap()
+                .iter()
+                .any(|f| f.check == "mirror_coverage" || f.check == "mirror_extra_row"),
+            "coverage must stay off until a table claims rings"
+        );
+    }
+
+    /// Several levels mean their union: a ring 1 term still needs a row, and a
+    /// ring 1 row is no longer outside the claim.
+    #[test]
+    fn several_rings_mean_their_union() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        let toml_path = onto.join("existence.toml");
+        let toml = fs::read_to_string(&toml_path).unwrap().replacen(
+            "\n\n[[mirrors]]",
+            "\n\n[rings.1]\nname = \"n\"\ndescription = \"d\"\nterms = [\"ghost\", \"unseen\"]\n\n[[mirrors]]",
+            1,
+        );
+        fs::write(&toml_path, toml).unwrap();
+        let config = with_rings(&onto, "[0, 1]");
+        let found: Vec<(String, String)> = check(&onto, &config, false)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.check == "mirror_coverage" || f.check == "mirror_extra_row")
+            .map(|f| (f.check, f.term))
+            .collect();
+        // `ghost` has a row so it is no longer extra; `unseen` has none.
+        assert!(
+            found.contains(&("mirror_coverage".to_string(), "unseen".to_string())),
+            "{found:#?}"
+        );
+        assert!(
+            !found.iter().any(|(check, _)| check == "mirror_extra_row"),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn rings_on_a_non_table_mirror_is_a_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        let toml_path = onto.join("existence.toml");
+        let toml = fs::read_to_string(&toml_path)
+            .unwrap()
+            .replace("kind = \"toc\"", "kind = \"toc\"\nrings = [0]");
+        fs::write(&toml_path, toml).unwrap();
+        let config = Config::load(&toml_path).unwrap();
+        let err = check(&onto, &config, false).unwrap_err();
+        assert!(
+            err.contains("only meaningful on a table mirror") && err.contains("'toc'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_ring_level_is_a_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        let config = with_rings(&onto, "[7]");
+        let err = check(&onto, &config, false).unwrap_err();
+        assert!(
+            err.contains("ring 7") && err.contains("not declared"),
+            "{err}"
+        );
     }
 
     #[test]

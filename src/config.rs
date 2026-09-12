@@ -33,6 +33,15 @@ pub struct Mirror {
     /// definition. Ignored by `nodes` and `toc`, which are always exact.
     #[serde(default = "default_compare")]
     pub compare: String,
+    /// For `table` mirrors, the ring levels this table claims to cover in
+    /// full: its rows are exactly the union of those rings' terms. Declaring
+    /// it turns on the coverage check in both directions — a term of a
+    /// declared ring with no row, and a row naming a term outside them. Omit
+    /// it for a table that is deliberately a partial copy; there is no way to
+    /// claim part of a ring, because a claim that permits arbitrary omission
+    /// would detect nothing. Rejected on `nodes` and `toc` mirrors.
+    #[serde(default)]
+    pub rings: Vec<u32>,
 }
 
 fn default_compare() -> String {
