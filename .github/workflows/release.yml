@@ -116,7 +116,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
-        run: .github/scripts/publish-crate.sh "${GITHUB_REF_NAME#v}"
+        run: .github/scripts/publish-crate.sh
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -144,6 +144,17 @@ jobs:
           for tag in $(git tag --list 'v*' --sort=version:refname); do
             echo "::group::$tag"
             git checkout --quiet --detach "$tag"
-            "$publish" "${tag#v}"
+            # Exit 3 is "no readable manifest here" — history is allowed to have
+            # commits this script cannot package, and walking past them is the
+            # point. A real publish failure (a rejected token, most likely) ends
+            # the run rather than repeating itself once per remaining tag.
+            set +e
+            "$publish"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+              echo "::endgroup::"
+              exit "$status"
+            fi
             echo "::endgroup::"
           done
