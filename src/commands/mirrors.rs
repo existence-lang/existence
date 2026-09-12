@@ -13,17 +13,26 @@
 //! kind = "toc"
 //!
 //! [[mirrors]]
-//! path = "~/.claude/CLAUDE.md" # a `| **Term** | summary |` table; rows scored against the node
+//! path = "~/.claude/CLAUDE.md" # a `| **Term** | summary |` table
 //! kind = "table"
 //! optional = true
+//! compare = "paraphrase"       # default; "wording" also scores row vs node text
 //! ```
 //!
 //! `nodes` mirrors are reported as a per-term diff of lay definitions with
 //! the markdown flattened to prose, so a `"broader"` link title, a link
 //! target spelling, or a missing Axiology section is not drift. `toc` mirrors are regenerated and
 //! compared byte for byte; `--fix` rewrites them. `table` mirrors are report
-//! only: a row whose term has no node, or whose summary shares too few words
-//! with the node's lay definition, is listed with both texts.
+//! only, and what counts as drift depends on `compare`. A one-line summary
+//! table is a paraphrase by nature — a good summary deliberately picks
+//! shorter, different words, so word overlap measures style, not accuracy
+//! (`Focus`: "Selectively concentrating on one system of the Existence" vs
+//! "Finite attention applied to a scope" share no words and say the same
+//! thing). So `paraphrase`, the default, reports only a row whose term has no
+//! node, which is the failure that silently rots a mirror when a term is
+//! renamed or removed. `compare = "wording"` additionally scores each row
+//! against its node's lay definition and lists both texts below
+//! [`TABLE_THRESHOLD`]; choose it for a table meant to quote the ontology.
 
 use crate::commands::audit::Finding;
 use crate::commands::toc;
@@ -40,6 +49,13 @@ pub const TABLE_THRESHOLD: f64 = 0.25;
 pub fn check(ontology_dir: &Path, config: &Config, fix: bool) -> Result<Vec<Finding>, String> {
     let mut out = Vec::new();
     for mirror in &config.mirrors {
+        // A typo here would silently disable the wording check, so fail loudly.
+        if !matches!(mirror.compare.as_str(), "paraphrase" | "wording") {
+            return Err(format!(
+                "mirror {}: unknown compare '{}' (expected paraphrase or wording)",
+                mirror.path, mirror.compare
+            ));
+        }
         let path = resolve(ontology_dir, &mirror.path)?;
         // A generated index that does not exist yet is stale, not missing:
         // `--fix` creates it.
@@ -197,8 +213,9 @@ fn toc_mirror(
     Ok(vec![f])
 }
 
-/// A `| **Term** | summary |` table: rows without a node, and rows whose
-/// summary shares too few words with the node's lay definition.
+/// A `| **Term** | summary |` table: rows without a node, and — only when
+/// `compare = "wording"` — rows whose summary shares too few words with the
+/// node's lay definition. See the module docs for why wording is opt-in.
 fn table_mirror(ontology_dir: &Path, mirror: &Mirror, file: &Path) -> Result<Vec<Finding>, String> {
     let src_dir = ontology_dir.join("src");
     let row = Regex::new(r"^\|\s*\*\*([^*|]+)\*\*\s*\|\s*(.*?)\s*\|\s*$").unwrap();
@@ -222,6 +239,9 @@ fn table_mirror(ontology_dir: &Path, mirror: &Mirror, file: &Path) -> Result<Vec
                 ),
                 None,
             ));
+            continue;
+        }
+        if mirror.compare != "wording" {
             continue;
         }
         let Some(definition) = markdown::extract_definition(&read(&node)?) else {
@@ -336,12 +356,64 @@ mod tests {
         )
         .unwrap();
         let toml = format!(
-            "[meta]\nname = \"t\"\ndescription = \"d\"\n\n[rings.0]\nname = \"k\"\ndescription = \"c\"\nterms = [\"existence\", \"entity\", \"scope\", \"state\", \"domain\"]\n\n[[mirrors]]\npath = \"../philosophy/src\"\nkind = \"nodes\"\n\n[[mirrors]]\npath = \"terms.md\"\nkind = \"toc\"\n\n[[mirrors]]\npath = \"{}\"\nkind = \"table\"\n\n[[mirrors]]\npath = \"../nowhere\"\nkind = \"nodes\"\noptional = true\n\n[[mirrors]]\npath = \"../also-nowhere\"\nkind = \"nodes\"\n",
+            "[meta]\nname = \"t\"\ndescription = \"d\"\n\n[rings.0]\nname = \"k\"\ndescription = \"c\"\nterms = [\"existence\", \"entity\", \"scope\", \"state\", \"domain\"]\n\n[[mirrors]]\npath = \"../philosophy/src\"\nkind = \"nodes\"\n\n[[mirrors]]\npath = \"terms.md\"\nkind = \"toc\"\n\n[[mirrors]]\npath = \"{}\"\nkind = \"table\"\ncompare = \"wording\"\n\n[[mirrors]]\npath = \"../nowhere\"\nkind = \"nodes\"\noptional = true\n\n[[mirrors]]\npath = \"../also-nowhere\"\nkind = \"nodes\"\n",
             tmp.join("TABLE.md").display()
         );
         fs::write(onto.join("existence.toml"), toml).unwrap();
         let config = Config::load(&onto.join("existence.toml")).unwrap();
         (onto, config)
+    }
+
+    /// Rewrite the fixture's table mirror to use a different `compare` value.
+    fn with_compare(onto: &Path, value: &str) -> Config {
+        let toml_path = onto.join("existence.toml");
+        let toml = fs::read_to_string(&toml_path)
+            .unwrap()
+            .replace("compare = \"wording\"", &format!("compare = \"{value}\""));
+        fs::write(&toml_path, toml).unwrap();
+        Config::load(&toml_path).unwrap()
+    }
+
+    #[test]
+    fn a_paraphrase_table_reports_a_missing_node_but_not_different_wording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        // `paraphrase` is the default, so dropping the key must behave the same
+        // as setting it; check both spellings reach the same findings.
+        for toml_value in ["paraphrase", ""] {
+            let config = if toml_value.is_empty() {
+                let toml_path = onto.join("existence.toml");
+                let toml = fs::read_to_string(&toml_path)
+                    .unwrap()
+                    .replace("compare = \"paraphrase\"\n", "");
+                fs::write(&toml_path, toml).unwrap();
+                Config::load(&toml_path).unwrap()
+            } else {
+                with_compare(&onto, toml_value)
+            };
+            let table: Vec<Finding> = check(&onto, &config, false)
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.message.contains("TABLE.md"))
+                .collect();
+            // `Scope`'s row says the same thing in its own words (overlap < 0.25
+            // under `wording`); only the row with no node survives.
+            assert_eq!(table.len(), 1, "{table:#?} for compare={toml_value:?}");
+            assert_eq!(table[0].term, "ghost");
+            assert!(table[0].message.contains("has no node"));
+        }
+    }
+
+    #[test]
+    fn an_unknown_compare_value_is_a_config_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (onto, _) = setup(tmp.path());
+        let config = with_compare(&onto, "exact");
+        let err = check(&onto, &config, false).unwrap_err();
+        assert!(
+            err.contains("unknown compare 'exact'") && err.contains("paraphrase or wording"),
+            "{err}"
+        );
     }
 
     #[test]

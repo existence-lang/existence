@@ -26,6 +26,17 @@ pub struct Mirror {
     /// Skip silently when the path does not exist (a mirror on another machine).
     #[serde(default)]
     pub optional: bool,
+    /// For `table` mirrors, how closely a row must track its node.
+    /// `paraphrase` (default) checks only that every row names a real node, so
+    /// a one-line summary may say the same thing in its own words.
+    /// `wording` also requires the row to share vocabulary with the node's lay
+    /// definition. Ignored by `nodes` and `toc`, which are always exact.
+    #[serde(default = "default_compare")]
+    pub compare: String,
+}
+
+fn default_compare() -> String {
+    "paraphrase".to_string()
 }
 
 #[derive(Debug, Deserialize)]
