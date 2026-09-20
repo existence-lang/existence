@@ -105,6 +105,17 @@ struct Client {
     pages: BTreeMap<String, Option<String>>,
     /// Candidate snapshot timestamps per page, in the order they are tried.
     stamps: BTreeMap<String, Vec<String>>,
+    /// The hosts the archive fallback itself runs on: the snapshot base, the
+    /// CDX index, and the availability API.
+    archive_hosts: BTreeSet<String>,
+    /// Archive hosts that failed this run, and the first reason. Tracked apart
+    /// from `unreachable` because these are not one citation's problem: when
+    /// the archive is down, every dead link and every lost quote in the run
+    /// loses its fallback at once.
+    archive_down: BTreeMap<String, String>,
+    /// Snapshots left unread because the archive was down, as opposed to
+    /// snapshots that are simply not there.
+    archive_unread: BTreeSet<String>,
 }
 
 impl Client {
@@ -125,6 +136,12 @@ impl Client {
             pin_unreachable: BTreeMap::new(),
             pages: BTreeMap::new(),
             stamps: BTreeMap::new(),
+            archive_hosts: [&opts.archive_web, &opts.cdx, &opts.wayback]
+                .iter()
+                .filter_map(|u| host_of(u))
+                .collect(),
+            archive_down: BTreeMap::new(),
+            archive_unread: BTreeSet::new(),
         }
     }
 
@@ -135,15 +152,27 @@ impl Client {
         if let Some(page) = self.pages.get(&raw) {
             return page.clone();
         }
-        let page = match self.get(&raw) {
+        let page = match self.get_archive(&raw) {
             Fetch::Response { status, body } if status < 400 => {
                 Some(normalise(&html_to_text(&body)))
             }
-            Fetch::Unreachable(reason) => {
-                self.pin_unreachable.insert(raw.clone(), reason);
+            // Any other outcome is a snapshot that was NOT read, whether the
+            // connection dropped or the server answered. Letting a status fall
+            // through as "read, and the passage is not in it" is what turned an
+            // archive outage into absent-quote errors against snapshots nobody
+            // had looked at -- and an outage arrives as a status far more often
+            // than as a dropped connection: archive.org answers its own
+            // downtime with a 503 page and a domain exclusion with a 403.
+            other => {
+                // Unread either way, but only a "later" counts toward the run
+                // losing its fallback; a 404 is one snapshot that is not there.
+                if outage_reason(&other).is_some() {
+                    self.archive_unread.insert(raw.clone());
+                }
+                self.pin_unreachable
+                    .insert(raw.clone(), failure_reason(&other));
                 None
             }
-            _ => None,
         };
         self.pages.insert(raw, page.clone());
         page
@@ -166,7 +195,7 @@ impl Client {
             opts.cdx,
             percent_encode(url)
         );
-        let rows: Vec<Vec<String>> = match self.get(&query) {
+        let rows: Vec<Vec<String>> = match self.get_archive(&query) {
             Fetch::Response { status, body } if status < 400 => {
                 serde_json::from_str(&body).unwrap_or_default()
             }
@@ -186,24 +215,50 @@ impl Client {
         }
         self.last = Some(Instant::now());
         // A transport error is retried once after one rate interval: a reset
-        // connection must not write off a whole host (or a snapshot) for the run.
+        // connection must not write off a whole host (or a snapshot) for the
+        // run. A 429 or 5xx is retried for the same reason -- rate limiting and
+        // "temporarily offline" are the two ways the archive says "later", and
+        // writing a host off on the first one is how a minute of downtime
+        // becomes a whole class reported as findings.
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.agent.get(url).call() {
                 Ok(mut resp) => {
                     let status = resp.status().as_u16();
+                    if retryable(status) && attempt < 2 {
+                        std::thread::sleep(self.rate);
+                        self.last = Some(Instant::now());
+                        continue;
+                    }
                     let body = resp.body_mut().read_to_string().unwrap_or_default();
-                    return Fetch::Response { status, body };
+                    break Fetch::Response { status, body };
                 }
                 Err(e) if attempt < 2 => {
                     std::thread::sleep(self.rate);
                     self.last = Some(Instant::now());
                     let _ = e;
                 }
-                Err(e) => return Fetch::Unreachable(e.to_string()),
+                Err(e) => break Fetch::Unreachable(e.to_string()),
             }
         }
+    }
+
+    /// `get`, for a fetch whose PURPOSE is the archive fallback: a snapshot, a
+    /// CDX query, an availability lookup. The distinction is not the host —
+    /// an ontology may cite a web.archive.org page as a source, and a 404 on
+    /// that citation is one dead link, not an outage of the fallback every
+    /// other citation depends on. Only a fetch the audit makes *in order to
+    /// resolve something else* can say the fallback is down.
+    fn get_archive(&mut self, url: &str) -> Fetch {
+        let out = self.get(url);
+        if let Some(host) = host_of(url)
+            && self.archive_hosts.contains(&host)
+            && let Some(reason) = outage_reason(&out)
+        {
+            self.archive_down.entry(host).or_insert(reason);
+        }
+        out
     }
 }
 
@@ -532,6 +587,15 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
         }
     }
 
+    // An archive outage is not one citation's problem, and reporting it as one
+    // per-term warning beside four others hides what actually happened: every
+    // dead link and every lost quote in the run lost its fallback at the same
+    // time, so most of the class ran without the thing that resolves it. A
+    // reader counting warnings sees a normal week. Say it once, at the level it
+    // happened, the way an optional pass that could not run says so rather than
+    // contributing no findings and passing for clean.
+    findings.extend(archive_outage_findings(&client));
+
     if fix {
         apply_dead_link_fixes(ontology_dir, &lock, &mut findings)?;
         apply_pin_fixes(ontology_dir, &to_write, &mut findings)?;
@@ -618,6 +682,35 @@ fn worst_word(verdicts: &[Verdict]) -> &'static str {
             Status::Live(word) => word,
         })
         .unwrap_or(sources::UNCHECKED)
+}
+
+/// One run-level finding per archive host that failed, naming what the run
+/// lost rather than leaving it to be inferred from the per-term warnings.
+///
+/// The term is the host itself: this is a finding about the archive, not about
+/// whichever node happened to be cited when it first failed.
+fn archive_outage_findings(client: &Client) -> Vec<Finding> {
+    client
+        .archive_down
+        .iter()
+        .map(|(host, reason)| {
+            let unread = client.archive_unread.len();
+            let pins = match unread {
+                0 => "no pinned snapshot was read".to_string(),
+                1 => "1 pinned snapshot could not be read".to_string(),
+                n => format!("{n} pinned snapshots could not be read"),
+            };
+            source_finding(
+                "archive_unavailable",
+                "warning",
+                host,
+                format!(
+                    "the archive host {host} was unavailable for this run ({reason}); {pins}, and no archived copy could answer for a dead link or a lost quote — the sources class ran without its fallback, so a clean-looking result this week is not evidence the sources are well"
+                ),
+                None,
+            )
+        })
+        .collect()
 }
 
 fn source_finding(
@@ -936,7 +1029,7 @@ fn candidate_order(rows: &[Vec<String>], around: &str) -> Vec<String> {
 /// The closest Wayback snapshot of `url`, if the availability API has one.
 fn wayback_lookup(client: &mut Client, endpoint: &str, url: &str) -> Option<String> {
     let query = format!("{endpoint}?url={}", percent_encode(url));
-    let Fetch::Response { status, body } = client.get(&query) else {
+    let Fetch::Response { status, body } = client.get_archive(&query) else {
         return None;
     };
     if status >= 400 {
@@ -961,6 +1054,38 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Statuses worth one more try: rate limiting, and the 5xx a host returns
+/// while it is down rather than gone.
+fn retryable(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// Why a fetch produced no page.
+fn failure_reason(out: &Fetch) -> String {
+    match out {
+        Fetch::Response { status, .. } => format!("HTTP {status}"),
+        Fetch::Unreachable(reason) => reason.clone(),
+    }
+}
+
+/// Whether a failed archive fetch means the archive is DOWN rather than the
+/// thing being absent from it.
+///
+/// This is the same predicate as `retryable`, and deliberately so: the archive
+/// is unavailable exactly when it says "later" — a dropped connection, rate
+/// limiting, or the 5xx it serves while offline. A 404 is a snapshot that does
+/// not exist and a 403 is one it will not serve; both are answers, and probing
+/// for candidate snapshots collects 404s as a matter of course. Counting those
+/// as an outage would report the fallback as down on a perfectly healthy run,
+/// which is the same false-reassurance bug in the opposite direction.
+fn outage_reason(out: &Fetch) -> Option<String> {
+    match out {
+        Fetch::Response { status, .. } if retryable(*status) => Some(format!("HTTP {status}")),
+        Fetch::Unreachable(reason) => Some(reason.clone()),
+        Fetch::Response { .. } => None,
+    }
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -1223,6 +1348,19 @@ mod tests {
                         "<p>A sentence that has since been lightly reworded here.</p>".to_string(),
                     )
                 } else if url == "/lostquote" {
+                    (
+                        200,
+                        "<p>Nothing of the passage survives here.</p>".to_string(),
+                    )
+                } else if url.starts_with("/archive/") && url.ends_with("/outage") {
+                    // How an archive outage actually arrives: a response, not a
+                    // dropped connection. archive.org answers its own downtime
+                    // with this page.
+                    (
+                        503,
+                        "<html><head><title>Internet Archive: Temporarily Offline</title></head><body>back soon</body></html>".to_string(),
+                    )
+                } else if url == "/outage" {
                     (
                         200,
                         "<p>Nothing of the passage survives here.</p>".to_string(),
@@ -1765,6 +1903,130 @@ mod tests {
             mine[0].message.contains("no snapshot carries it verbatim"),
             "{:?}",
             mine[0]
+        );
+    }
+
+    /// An archive outage arrives as a RESPONSE far more often than as a
+    /// dropped connection -- archive.org answers its own downtime with a 503
+    /// and a domain exclusion with a 403. The guard against escalating an
+    /// unread pin into an absent-quote error only covered the transport door,
+    /// so the shape that actually happens walked straight through it.
+    fn outage_setup(tmp: &Path, base: &str) -> (String, String) {
+        setup(tmp, base);
+        let url = format!("{base}/outage");
+        let pin = format!("{base}/archive/20150101000000/{base}/outage");
+        fs::write(
+            tmp.join("src/vault.md"),
+            pinned_node(
+                "Vault",
+                &url,
+                &pin,
+                "A passage that vanished from the page.",
+            ),
+        )
+        .unwrap();
+        (url, pin)
+    }
+
+    #[test]
+    fn an_archive_that_answers_with_an_error_status_is_a_pin_nobody_read() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        outage_setup(tmp.path(), &base);
+
+        let findings = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "vault").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(
+            (mine[0].check.as_str(), mine[0].severity.as_str()),
+            ("pin_unreachable", "warning"),
+            "a 503 snapshot must not be read as a snapshot lacking the passage: {:?}",
+            mine[0]
+        );
+        assert!(mine[0].message.contains("HTTP 503"), "{:?}", mine[0]);
+        assert!(
+            findings.iter().all(|f| f.check != "quote_missing"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn an_archive_outage_is_reported_once_at_the_run_level() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        outage_setup(tmp.path(), &base);
+
+        let findings = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        let outage: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.check == "archive_unavailable")
+            .collect();
+        // Once, for the host -- not once per citation that lost its fallback.
+        assert_eq!(outage.len(), 1, "{findings:?}");
+        assert_eq!(outage[0].severity, "warning");
+        assert_eq!(outage[0].term, host_of(&base).unwrap());
+        assert!(outage[0].message.contains("HTTP 503"), "{:?}", outage[0]);
+        // The count is whatever the run actually failed to read; asserting a
+        // number here would pin the stub server's route table rather than the
+        // behaviour. What matters is that it is real, and that routine 404s on
+        // absent candidate snapshots do not inflate it (covered separately by
+        // `a_source_that_merely_lives_on_the_archive_host_is_not_an_outage`).
+        let unread: usize = outage[0]
+            .message
+            .split(" pinned snapshot")
+            .next()
+            .and_then(|s| s.rsplit("; ").next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        assert!(unread >= 1, "{:?}", outage[0]);
+        // The point of the finding: a reader counting warnings must not read
+        // this week as a normal one.
+        assert!(
+            outage[0].message.contains("ran without its fallback"),
+            "{:?}",
+            outage[0]
+        );
+    }
+
+    #[test]
+    fn a_retryable_archive_status_is_tried_again_before_it_is_believed() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        outage_setup(tmp.path(), &base);
+
+        check(tmp.path(), &opts(&base, 10), false).unwrap();
+        let hits = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|u| u.contains("20150101000000") && u.ends_with("/outage"))
+            .count();
+        // A minute of downtime must not write the archive off for the week.
+        assert_eq!(hits, 2, "a 503 is retried exactly once");
+    }
+
+    #[test]
+    fn a_source_that_merely_lives_on_the_archive_host_is_not_an_outage() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        // `setup` already cites {base}/gone, a 404 on the same host the archive
+        // endpoints run on. An ontology really does cite archived pages as
+        // sources, so a dead one of those is one dead link -- not the fallback
+        // every other citation depends on going down.
+        setup(tmp.path(), &base);
+
+        let findings = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        assert!(
+            findings.iter().any(|f| f.check == "dead_link"),
+            "fixture must still produce the dead link: {findings:?}"
+        );
+        assert!(
+            findings.iter().all(|f| f.check != "archive_unavailable"),
+            "{findings:?}"
         );
     }
 
