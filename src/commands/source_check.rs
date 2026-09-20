@@ -95,7 +95,12 @@ struct Client {
     agent: ureq::Agent,
     rate: Duration,
     last: Option<Instant>,
-    unreachable: BTreeSet<String>,
+    /// Hosts that failed, and the reason, so every source on one is handled
+    /// the same way without being fetched again.
+    unreachable: BTreeMap<String, String>,
+    /// Snapshots whose own fetch failed, by raw snapshot URL. A snapshot that
+    /// was never read cannot be said to lack a passage.
+    pin_unreachable: BTreeMap<String, String>,
     /// Normalised snapshot pages by raw snapshot URL, fetched once per run.
     pages: BTreeMap<String, Option<String>>,
     /// Candidate snapshot timestamps per page, in the order they are tried.
@@ -116,7 +121,8 @@ impl Client {
             agent: config.new_agent(),
             rate: opts.rate,
             last: None,
-            unreachable: BTreeSet::new(),
+            unreachable: BTreeMap::new(),
+            pin_unreachable: BTreeMap::new(),
             pages: BTreeMap::new(),
             stamps: BTreeMap::new(),
         }
@@ -133,10 +139,20 @@ impl Client {
             Fetch::Response { status, body } if status < 400 => {
                 Some(normalise(&html_to_text(&body)))
             }
+            Fetch::Unreachable(reason) => {
+                self.pin_unreachable.insert(raw.clone(), reason);
+                None
+            }
             _ => None,
         };
         self.pages.insert(raw, page.clone());
         page
+    }
+
+    /// Why a pinned snapshot could not be fetched this run, if it could not.
+    /// A pin that was never read says nothing about the passage it holds.
+    fn pin_fetch_failed(&self, archive: &str) -> Option<&String> {
+        self.pin_unreachable.get(&raw_snapshot_url(archive))
     }
 
     /// The snapshots of `url` in the order they are tried, from one CDX
@@ -211,19 +227,71 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
 
     for (url, entry) in lock.iter_mut() {
         let Some(host) = host_of(url) else { continue };
-        if client.unreachable.contains(&host) {
-            continue;
-        }
-        match client.get(url) {
+        // A host that already failed is not fetched again, but its sources are
+        // still handled rather than skipped outright: an unreachable source
+        // host says nothing about the archive host, so a pinned copy can still
+        // answer for the citation.
+        let fetched = match client.unreachable.get(&host) {
+            Some(reason) => Fetch::Unreachable(reason.clone()),
+            None => client.get(url),
+        };
+        match fetched {
             Fetch::Unreachable(reason) => {
-                client.unreachable.insert(host.clone());
-                findings.push(source_finding(
-                    "unreachable_host",
-                    "warning",
-                    &entry.cited_by[0],
-                    format!("host {host} is unreachable ({reason}); its sources were skipped"),
-                    None,
-                ));
+                client
+                    .unreachable
+                    .entry(host.clone())
+                    .or_insert_with(|| reason.clone());
+                // The same archive lookup a 4xx dead link gets. Without it an
+                // unreachable host could never resolve: it warned every run
+                // with no fix to apply, while a dead link pinned itself and
+                // cleared.
+                if entry.archives.is_empty()
+                    && let Some(archive) = wayback_lookup(&mut client, &opts.wayback, url)
+                {
+                    entry.archives.push(archive);
+                }
+                for term in entry.cited_by.clone() {
+                    let own = pins_for(&all, &term, url);
+                    // A pin already beside the link that still fetches keeps
+                    // the citation verifiable; there is nothing to report.
+                    if own.iter().any(|p| client.snapshot_page(p).is_some()) {
+                        continue;
+                    }
+                    let mut offer = None;
+                    for pin in entry.archives.clone() {
+                        if !own.contains(&pin) && client.snapshot_page(&pin).is_some() {
+                            offer = Some(pin);
+                            break;
+                        }
+                    }
+                    match offer {
+                        Some(pin) => {
+                            findings.push(source_finding(
+                                "unreachable_host",
+                                "warning",
+                                &term,
+                                format!(
+                                    "host {host} is unreachable ({reason}); the archived copy {pin} still carries this source"
+                                ),
+                                Some(format!("pin the archived copy {pin} beside the link")),
+                            ));
+                            to_write.push(PinWrite {
+                                term: term.clone(),
+                                url: url.clone(),
+                                pins: vec![pin],
+                            });
+                        }
+                        None => findings.push(source_finding(
+                            "unreachable_host",
+                            "warning",
+                            &term,
+                            format!(
+                                "host {host} is unreachable ({reason}); its sources were skipped"
+                            ),
+                            None,
+                        )),
+                    }
+                }
             }
             Fetch::Response { status, body } => {
                 entry.fetched_at = Some(now.clone());
@@ -328,38 +396,136 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                             .chain(entry.archives.iter().filter(|a| !own.contains(a)))
                             .map(String::as_str)
                             .collect();
-                        let message = if pins.is_empty() {
-                            format!(
-                                "quoted passage no longer found on {url}: \u{201c}{}\u{201d}{more}",
-                                clip(first)
-                            )
+                        // A pin whose own fetch failed was never read, so it
+                        // cannot be reported as a pin that does not carry the
+                        // passage. That escalated an unreachable archive into
+                        // an absent-quote error against a snapshot nobody had
+                        // looked at.
+                        let unread: Vec<String> = known
+                            .iter()
+                            .filter_map(|p| {
+                                client.pin_fetch_failed(p).map(|why| format!("{p} ({why})"))
+                            })
+                            .collect();
+                        if unread.is_empty() {
+                            let message = if pins.is_empty() {
+                                format!(
+                                    "quoted passage no longer found on {url}: \u{201c}{}\u{201d}{more}",
+                                    clip(first)
+                                )
+                            } else {
+                                format!(
+                                    "quoted passage found neither on {url} nor in its pinned copy {}: \u{201c}{}\u{201d}{more}",
+                                    pins.join(", "),
+                                    clip(first)
+                                )
+                            };
+                            findings.push(source_finding(
+                                "quote_missing",
+                                "error",
+                                &term,
+                                message,
+                                None,
+                            ));
                         } else {
-                            format!(
-                                "quoted passage found neither on {url} nor in its pinned copy {}: \u{201c}{}\u{201d}{more}",
-                                pins.join(", "),
-                                clip(first)
-                            )
-                        };
-                        findings.push(source_finding(
-                            "quote_missing",
-                            "error",
-                            &term,
-                            message,
-                            None,
-                        ));
-                    } else if let Some(moved) =
-                        verdicts.iter().find(|v| v.status == Status::Live("moved"))
-                    {
-                        findings.push(source_finding(
-                            "quote_moved",
-                            "warning",
-                            &term,
-                            format!(
-                                "quoted passage on {url} has changed but still matches: \u{201c}{}\u{201d}",
-                                clip(&moved.quote)
-                            ),
-                            None,
-                        ));
+                            findings.push(source_finding(
+                                "pin_unreachable",
+                                "warning",
+                                &term,
+                                format!(
+                                    "quoted passage is not on {url} and its pinned copy {} could not be fetched, so the pin was not checked: \u{201c}{}\u{201d}{more}",
+                                    unread.join(", "),
+                                    clip(first)
+                                ),
+                                None,
+                            ));
+                        }
+                    } else {
+                        // A passage the live page still carries but has
+                        // drifted from. The pin is the citation of record: if
+                        // one beside the link carries it verbatim, nothing has
+                        // been lost and there is nothing to report. Otherwise
+                        // look for a snapshot that does and offer it -- the
+                        // resolution path `quote_moved` never had, which is why
+                        // these warnings accumulated run after run with nothing
+                        // anyone could do about them.
+                        let drifted: Vec<String> = verdicts
+                            .iter()
+                            .filter(|v| v.status == Status::Live("moved"))
+                            .map(|v| v.quote.clone())
+                            .collect();
+                        let mut fresh: Vec<String> = Vec::new();
+                        let mut anchored = String::new();
+                        let mut adrift: Option<String> = None;
+                        let mut pinned: Vec<(String, String)> = Vec::new();
+                        for quote in drifted {
+                            let mut found = None;
+                            for pin in &own {
+                                if client
+                                    .snapshot_page(pin)
+                                    .is_some_and(|page| match_quote(&page, &quote) == "present")
+                                {
+                                    found = Some(pin.clone());
+                                    break;
+                                }
+                            }
+                            let found = match found {
+                                Some(pin) => Some(pin),
+                                None => {
+                                    find_exact_pin(&mut client, opts, url, &quote).inspect(|pin| {
+                                        if !entry.archives.contains(pin) {
+                                            entry.archives.push(pin.clone());
+                                        }
+                                        if !fresh.contains(pin) {
+                                            fresh.push(pin.clone());
+                                            anchored = quote.clone();
+                                        }
+                                    })
+                                }
+                            };
+                            match found {
+                                Some(pin) => pinned.push((quote, pin)),
+                                None => adrift = adrift.or(Some(quote)),
+                            }
+                        }
+                        for v in verdicts.iter_mut() {
+                            if let Some((_, pin)) = pinned.iter().find(|(q, _)| *q == v.quote) {
+                                v.status = Status::Pinned(pin.clone());
+                            }
+                        }
+                        entry
+                            .quotes
+                            .insert(term.clone(), worst_word(&verdicts).to_string());
+                        if !fresh.is_empty() {
+                            let pins = fresh.join(", ");
+                            findings.push(source_finding(
+                                "quote_moved",
+                                "warning",
+                                &term,
+                                format!(
+                                    "quoted passage on {url} has changed but still matches; the snapshot {pins} carries it verbatim: \u{201c}{}\u{201d}",
+                                    clip(&anchored)
+                                ),
+                                Some(format!("pin the archived copy {pins} beside the link")),
+                            ));
+                            to_write.push(PinWrite {
+                                term: term.clone(),
+                                url: url.clone(),
+                                pins: fresh,
+                            });
+                        }
+                        if let Some(quote) = adrift {
+                            findings.push(source_finding(
+                                "quote_moved",
+                                "warning",
+                                &term,
+                                format!(
+                                    "quoted passage on {url} has changed but still matches, and no snapshot carries it verbatim: \u{201c}{}\u{201d}",
+                                    clip(&quote)
+                                ),
+                                None,
+                            ));
+                        }
                     }
                 }
             }
@@ -381,6 +547,10 @@ enum Status {
     Live(&'static str),
     /// Not on the live page, but in this pinned snapshot.
     Archived(String),
+    /// On the live page but drifted, and this pinned snapshot carries it
+    /// verbatim. Distinct from `Archived`, which asks `--fix` to write a pin
+    /// for a passage the live page has lost.
+    Pinned(String),
     /// Nowhere yet.
     Missing,
 }
@@ -436,7 +606,7 @@ fn worst_word(verdicts: &[Verdict]) -> &'static str {
     let rank = |v: &&Verdict| match &v.status {
         Status::Missing => 4,
         Status::Live("moved") => 3,
-        Status::Archived(_) => 2,
+        Status::Archived(_) | Status::Pinned(_) => 2,
         Status::Live(_) => 1,
     };
     verdicts
@@ -444,7 +614,7 @@ fn worst_word(verdicts: &[Verdict]) -> &'static str {
         .max_by_key(rank)
         .map(|v| match &v.status {
             Status::Missing => "missing",
-            Status::Archived(_) => "archived",
+            Status::Archived(_) | Status::Pinned(_) => "archived",
             Status::Live(word) => word,
         })
         .unwrap_or(sources::UNCHECKED)
@@ -554,9 +724,14 @@ fn apply_pin_fixes(
         }
         std::fs::write(&path, out)
             .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        // Every check whose remedy is a pin beside the link: a passage the
+        // live page lost, one it still carries but has drifted from, and a
+        // source whose host no longer answers at all.
         for f in findings.iter_mut().filter(|f| {
-            f.check == "quote_missing"
-                && f.term == w.term
+            matches!(
+                f.check.as_str(),
+                "quote_missing" | "quote_moved" | "unreachable_host"
+            ) && f.term == w.term
                 && f.fix
                     .as_deref()
                     .is_some_and(|fix| w.pins.iter().all(|p| fix.contains(p.as_str())))
@@ -648,6 +823,36 @@ fn find_pins(
         }
     }
     pins
+}
+
+/// The nearest snapshot of `url` carrying `quote` verbatim, from the window
+/// `find_pins` tries first.
+///
+/// A drifted passage is still on the live page, so only the nearest window is
+/// searched: enough to anchor a citation, not a whole-archive sweep for every
+/// warning. `find_pins` accepts a snapshot where the quote has also drifted,
+/// which would resolve nothing here -- anchoring a drifted quote to a copy it
+/// has also drifted from leaves the same warning next run.
+fn find_exact_pin(
+    client: &mut Client,
+    opts: &SourceOptions,
+    url: &str,
+    quote: &str,
+) -> Option<String> {
+    let stamps: Vec<String> = client
+        .snapshot_stamps(opts, url)
+        .into_iter()
+        .take(PIN_CANDIDATES)
+        .collect();
+    for ts in stamps {
+        let pin = format!("{}/{ts}/{url}", opts.archive_web);
+        if let Some(page) = client.snapshot_page(&pin)
+            && match_quote(&page, quote) == "present"
+        {
+            return Some(pin);
+        }
+    }
+    None
 }
 
 /// Pin, from the nearest window, the snapshot covering the most remaining
@@ -1011,7 +1216,23 @@ mod tests {
             for req in server.incoming_requests() {
                 let url = req.url().to_string();
                 log.lock().unwrap().push(url.clone());
-                let (code, body) = if url == "/live" {
+                let (code, body) = if url == "/adrift" {
+                    // Drifted from its quote, and no snapshot carries it.
+                    (
+                        200,
+                        "<p>A sentence that has since been lightly reworded here.</p>".to_string(),
+                    )
+                } else if url == "/lostquote" {
+                    (
+                        200,
+                        "<p>Nothing of the passage survives here.</p>".to_string(),
+                    )
+                } else if url.starts_with("/archive/") && url.ends_with("/relic") {
+                    (
+                        200,
+                        "<p>The relic, as it read before the host went away.</p>".to_string(),
+                    )
+                } else if url == "/live" {
                     (200, "<p>Anything in Existence that can be distinguished from anything else.</p>".to_string())
                 } else if url == "/drifted" {
                     (
@@ -1068,10 +1289,23 @@ mod tests {
                 } else if url == "/changed" {
                     (200, "<p>Anything in Existence which can be distinguished from anything else.</p>".to_string())
                 } else if url.starts_with("/wayback/available") {
+                    // The relic's snapshot is one this server actually serves,
+                    // so an unreachable host can be offered a working pin.
+                    let (snap, ts) = if url.contains("relic") {
+                        // A snapshot OF the requested URL, the way the real
+                        // availability API answers -- the pin has to carry the
+                        // source URL or it is not a pin of that source.
+                        (
+                            format!("{base}/archive/20150301000000/http://127.0.0.1:1/relic"),
+                            "20150301000000",
+                        )
+                    } else {
+                        (archive.clone(), "20260101000000")
+                    };
                     (
                         200,
                         format!(
-                            r#"{{"archived_snapshots":{{"closest":{{"available":true,"url":"{archive}","timestamp":"20260101000000"}}}}}}"#
+                            r#"{{"archived_snapshots":{{"closest":{{"available":true,"url":"{snap}","timestamp":"{ts}"}}}}}}"#
                         ),
                     )
                 } else {
@@ -1363,7 +1597,9 @@ mod tests {
         assert_eq!(live.quotes["entity"], "present");
         assert!(live.fetched_at.as_deref().unwrap().ends_with('Z'));
         assert_eq!(live.content_sha256.as_deref().map(str::len), Some(64));
-        assert_eq!(lock[&format!("{base}/changed")].quotes["being"], "moved");
+        // A drifted quote the archive can anchor is recorded as archived, not
+        // left as `moved` with nothing anyone could do about it.
+        assert_eq!(lock[&format!("{base}/changed")].quotes["being"], "archived");
         let gone = &lock[&format!("{base}/gone")];
         assert_eq!(gone.status, Some(404));
         assert_eq!(
@@ -1383,6 +1619,14 @@ mod tests {
             (moved[0].term.as_str(), moved[0].severity.as_str()),
             ("being", "warning")
         );
+        // It now carries a remedy: without one it could only be re-reported.
+        assert!(
+            moved[0]
+                .fix
+                .as_deref()
+                .is_some_and(|f| f.contains("/archive/20150301000000/")),
+            "{moved:?}"
+        );
         let dead = by_check("dead_link");
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].term, "soul");
@@ -1396,21 +1640,208 @@ mod tests {
                 .contains("/archive/20260101000000/gone")
         );
         assert!(!dead[0].fixed);
+        // Every source on the dead host is reported, not just the first: each
+        // one has its own pin to look for, and the host is fetched only once.
         let skipped = by_check("unreachable_host");
-        assert_eq!(skipped.len(), 1, "one warning per host, not per URL");
-        assert_eq!(skipped[0].term, "ghost");
-        assert!(skipped[0].message.contains("127.0.0.1:1"));
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped.iter().all(|f| f.term == "ghost"));
+        assert!(skipped.iter().all(|f| f.message.contains("127.0.0.1:1")));
 
-        // The wayback endpoint was asked once, for the dead link only.
+        // The archive was asked about the dead link and about each source on
+        // the unreachable host; the host itself was attempted once.
         let requests = log.lock().unwrap().clone();
         assert_eq!(
             requests
                 .iter()
                 .filter(|u| u.starts_with("/wayback"))
                 .count(),
-            1
+            3
         );
         assert!(requests.iter().any(|u| u.contains("gone")));
+    }
+
+    /// A node with a source anchor and one pin already beside it.
+    fn pinned_node(title: &str, url: &str, pin: &str, quote: &str) -> String {
+        format!(
+            "# {title}\n\n## Ontology\n\nx\n\n## Axiology\n\nx\n\n## Epistemology\n\n<a href=\"{url}\" target=\"_blank\">{title} (source)</a> <a href=\"{pin}\" target=\"_blank\">(archived)</a>\n\n> {quote}\n"
+        )
+    }
+
+    const DRIFTED: &str = "Anything in Existence that can be distinguished from anything else.";
+
+    /// A passage the live page has drifted from is not a finding when a pin
+    /// beside the link still carries it word for word: the pin is the citation
+    /// of record, so nothing has been lost and there is nothing to report.
+    #[test]
+    fn a_drifted_quote_its_own_pin_carries_verbatim_is_not_reported() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/changed");
+        let pin = format!("{base}/archive/20150301000000/{url}");
+        fs::write(
+            tmp.path().join("src/anchor.md"),
+            pinned_node("Anchor", &url, &pin, DRIFTED),
+        )
+        .unwrap();
+        let before = fs::read_to_string(tmp.path().join("src/anchor.md")).unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        assert!(findings.iter().all(|f| f.term != "anchor"), "{findings:?}");
+        let lock = sources::read_lock(&tmp.path().join("audit/sources.lock.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lock[&url].quotes["anchor"], "archived");
+        assert_eq!(
+            before,
+            fs::read_to_string(tmp.path().join("src/anchor.md")).unwrap(),
+            "the pin already there answered; nothing was rewritten"
+        );
+    }
+
+    /// The resolution path `quote_moved` did not have: search the nearest
+    /// snapshots for one that carries the passage verbatim, offer it as the
+    /// fix, and write it. Without this the warning could only be re-reported
+    /// every run, which is how sixty-one of them accumulated.
+    #[test]
+    fn fix_pins_a_snapshot_that_carries_a_drifted_quote_verbatim() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/changed");
+        let pin = format!("{base}/archive/20150301000000/{url}");
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let moved: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.check == "quote_moved" && f.term == "being")
+            .collect();
+        assert_eq!(moved.len(), 1, "{findings:?}");
+        assert_eq!(
+            moved[0].fix.as_deref(),
+            Some(format!("pin the archived copy {pin} beside the link").as_str())
+        );
+        assert!(moved[0].fixed);
+        let being = fs::read_to_string(tmp.path().join("src/being.md")).unwrap();
+        assert!(being.contains(&format!("<a href=\"{pin}\"")), "{being}");
+
+        // Second run: the pin is read back and the warning is gone for good.
+        let again = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        assert!(again.iter().all(|f| f.term != "being"), "{again:?}");
+        assert_eq!(
+            being,
+            fs::read_to_string(tmp.path().join("src/being.md")).unwrap(),
+            "the pin is written once"
+        );
+    }
+
+    /// When no snapshot carries the passage verbatim the warning stands, with
+    /// no fix — there is genuinely nothing to apply.
+    #[test]
+    fn a_drifted_quote_no_snapshot_carries_is_reported_without_a_fix() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        fs::write(
+            tmp.path().join("src/adrift.md"),
+            node(
+                "Adrift",
+                &format!("{base}/adrift"),
+                "A sentence that has since been lightly reworded there.",
+            ),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "adrift").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(mine[0].check, "quote_moved");
+        assert_eq!(mine[0].severity, "warning");
+        assert_eq!(mine[0].fix, None);
+        assert!(
+            mine[0].message.contains("no snapshot carries it verbatim"),
+            "{:?}",
+            mine[0]
+        );
+    }
+
+    /// A pin whose own fetch failed was never read, so it cannot be reported
+    /// as a pin that does not carry the passage. Saying otherwise turned an
+    /// unreachable archive into an absent-quote error against a snapshot
+    /// nobody had looked at.
+    #[test]
+    fn a_pin_that_could_not_be_fetched_is_not_an_absent_quote() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/lostquote");
+        let dead_pin = format!("http://127.0.0.1:1/archive/20150101000000/{url}");
+        fs::write(
+            tmp.path().join("src/vault.md"),
+            pinned_node(
+                "Vault",
+                &url,
+                &dead_pin,
+                "A passage that vanished from the page.",
+            ),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "vault").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(
+            (mine[0].check.as_str(), mine[0].severity.as_str()),
+            ("pin_unreachable", "warning"),
+            "{:?}",
+            mine[0]
+        );
+        assert!(mine[0].message.contains("127.0.0.1:1"), "{:?}", mine[0]);
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.check != "quote_missing" || f.term != "vault"),
+            "{findings:?}"
+        );
+    }
+
+    /// An unreachable source host says nothing about the archive host, so the
+    /// archive is still searched and the pin still offered. Without this a
+    /// dead host warned every run with no fix to apply, while a 4xx dead link
+    /// pinned itself and cleared.
+    #[test]
+    fn an_unreachable_host_is_offered_and_keeps_its_archived_copy() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        fs::write(
+            tmp.path().join("src/relic.md"),
+            node("Relic", "http://127.0.0.1:1/relic", "Whatever it said."),
+        )
+        .unwrap();
+        let pin = format!("{base}/archive/20150301000000/http://127.0.0.1:1/relic");
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "relic").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(mine[0].check, "unreachable_host");
+        assert_eq!(
+            mine[0].fix.as_deref(),
+            Some(format!("pin the archived copy {pin} beside the link").as_str())
+        );
+        assert!(mine[0].fixed);
+        let relic = fs::read_to_string(tmp.path().join("src/relic.md")).unwrap();
+        assert!(relic.contains(&format!("<a href=\"{pin}\"")), "{relic}");
+
+        // Second run: the pin answers for the citation and the host's
+        // unreachability is no longer worth reporting.
+        let again = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        assert!(again.iter().all(|f| f.term != "relic"), "{again:?}");
     }
 
     #[test]
