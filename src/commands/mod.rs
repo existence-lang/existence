@@ -14,3 +14,4 @@ pub mod source_check;
 pub mod sources;
 pub mod sparql;
 pub mod toc;
+pub mod waivers;

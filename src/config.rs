@@ -24,6 +24,42 @@ pub struct Audit {
     /// Mentions reviewed and deliberately left unlinked.
     #[serde(default)]
     pub keep_unlinked: Vec<KeepUnlinked>,
+    /// Findings reviewed and deliberately accepted as they are.
+    #[serde(default)]
+    pub waiver: Vec<Waiver>,
+}
+
+/// One `[[audit.waiver]]` entry: a finding a person reviewed and decided to
+/// live with. A matching finding still prints, carrying the reason, but drops
+/// to severity `accepted` and is counted as neither an error nor a warning.
+///
+/// The sibling of `keep_unlinked`, one level up: that one accepts a specific
+/// mention in a lay definition, this one accepts any finding any class raises,
+/// which is what a decision about the outside web needs — a page that is gone
+/// from the live site, the Wayback Machine and every mirror is not going to
+/// come back, and the only question left is whether to drop the citation or
+/// keep it and live with the warning.
+///
+/// `reason` has no default for the same reason `keep_unlinked`'s does not.
+/// `decided_on` is the one field the sibling has no use for: a structural
+/// decision stays true until someone edits the node, while a decision about
+/// somebody else's website is a claim about a world that keeps moving, so the
+/// record has to say when its evidence was last checked.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Waiver {
+    /// The node the finding is about (the slug).
+    pub term: String,
+    /// The check that raises it: `unreachable_host`, `dead_link`, `lint`, …
+    pub check: String,
+    /// Optional narrowing: a URL or a host, matched as a substring of the
+    /// finding's message, so a term cited from several pages can accept one of
+    /// them without accepting the rest.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Why this is accepted rather than fixed. Printed in the report.
+    pub reason: String,
+    /// `YYYY-MM-DD`, when the decision was made.
+    pub decided_on: String,
 }
 
 /// One `[[audit.keep_unlinked]]` entry: a mention of `mention` in the lay
@@ -100,7 +136,35 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        toml::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        config.validate(path)?;
+        Ok(config)
+    }
+
+    /// Checks toml's types cannot express. A malformed decision has to fail the
+    /// parse rather than be skipped: an entry the audit silently failed to read
+    /// leaves a report that looks exactly like one with no entry at all.
+    fn validate(&self, path: &Path) -> Result<(), String> {
+        for (i, w) in self.audit.waiver.iter().enumerate() {
+            let at = format!("{}: audit.waiver[{i}]", path.display());
+            for (field, value) in [
+                ("term", &w.term),
+                ("check", &w.check),
+                ("reason", &w.reason),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("{at}: `{field}` must not be empty"));
+                }
+            }
+            if !is_iso_date(&w.decided_on) {
+                return Err(format!(
+                    "{at}: `decided_on` must be YYYY-MM-DD, got `{}`",
+                    w.decided_on
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Get a ring by its numeric level, parsing the string key.
@@ -278,4 +342,16 @@ terms = ["existence"]
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), tmp.path());
     }
+}
+
+/// `YYYY-MM-DD`, by shape. A real calendar check would need a date crate for a
+/// field whose job is to be legible to a person a year from now.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
 }

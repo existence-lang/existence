@@ -39,7 +39,7 @@
 
 use crate::commands::semantic::{self, SemanticOptions};
 use crate::commands::source_check::{self, SourceOptions};
-use crate::commands::{lint, mirrors, toc};
+use crate::commands::{lint, mirrors, toc, waivers};
 use crate::config::{Config, KeepUnlinked};
 use crate::markdown;
 use regex::Regex;
@@ -70,6 +70,9 @@ pub struct Finding {
 pub struct Summary {
     pub errors: usize,
     pub warnings: usize,
+    /// Findings an `audit/waivers.json` entry accepts: still reported, counted
+    /// as neither an error nor a warning, and not blocking `clean`.
+    pub accepted: usize,
     pub fixable: usize,
     pub fixed: usize,
 }
@@ -206,9 +209,20 @@ pub fn build_with(
         findings.extend(semantic::check(ontology_dir, semantic_opts)?);
     }
 
+    // Applied once over the whole report rather than inside a class: "the
+    // author has decided to live with this" is the same decision whichever
+    // check raised it, and a waiver that matched nothing reports itself here
+    // rather than quietly waiving nothing.
+    let stale = waivers::apply(&mut findings, &config.audit.waiver);
+    findings.extend(stale);
+
     let summary = Summary {
         errors: findings.iter().filter(|f| f.severity == "error").count(),
         warnings: findings.iter().filter(|f| f.severity == "warning").count(),
+        accepted: findings
+            .iter()
+            .filter(|f| f.severity == waivers::ACCEPTED)
+            .count(),
         fixable: findings.iter().filter(|f| f.fix.is_some()).count(),
         fixed: findings.iter().filter(|f| f.fixed).count(),
     };
@@ -706,10 +720,10 @@ pub fn to_text(report: &Report) -> String {
         } else {
             ""
         };
-        let level = if f.severity == "warning" {
-            "warn: "
-        } else {
-            ""
+        let level = match f.severity.as_str() {
+            "warning" => "warn: ",
+            waivers::ACCEPTED => "accepted: ",
+            _ => "",
         };
         out.push_str(&format!(
             "{}: [{}] {level}{}{tag}\n",
@@ -717,8 +731,13 @@ pub fn to_text(report: &Report) -> String {
         ));
     }
     let s = &report.summary;
+    let accepted = if s.accepted > 0 {
+        format!(", {} accepted", s.accepted)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "audit ({}): {} error(s), {} warning(s), {} fixable, {} fixed — {}\n",
+        "audit ({}): {} error(s), {} warning(s){accepted}, {} fixable, {} fixed — {}\n",
         report.classes.join(","),
         s.errors,
         s.warnings,
@@ -794,6 +813,181 @@ mod tests {
             .iter()
             .map(|f| (f.check.clone(), f.term.clone(), f.severity.clone()))
             .collect()
+    }
+
+    /// A waiver is an author decision recorded beside the ontology. These
+    /// drive it end to end through `build_with`, because the unit tests in
+    /// `waivers` prove the matcher and say nothing about whether the audit
+    /// actually consults it.
+    fn structure_only() -> Classes {
+        Classes {
+            structure: true,
+            contradictions: false,
+            sources: false,
+            mirrors: false,
+            semantic: false,
+        }
+    }
+
+    fn waiver_file(tmp: &Path, body: &str) {
+        let manifest = tmp.join("existence.toml");
+        let mut text = fs::read_to_string(&manifest).unwrap();
+        text.push_str(body);
+        fs::write(&manifest, text).unwrap();
+    }
+
+    #[test]
+    fn a_waiver_demotes_a_real_finding_and_the_counts_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        let before = build(tmp.path(), structure_only(), false).unwrap();
+        let lint_errors = before
+            .findings
+            .iter()
+            .filter(|f| f.check == "lint" && f.term == "stray")
+            .count();
+        assert!(
+            lint_errors > 0,
+            "fixture must raise the finding being waived"
+        );
+
+        waiver_file(
+            tmp.path(),
+            "\n[[audit.waiver]]\nterm = \"stray\"\ncheck = \"lint\"\nreason = \"a deliberate fixture\"\ndecided_on = \"2026-09-20\"\n",
+        );
+        let after = build(tmp.path(), structure_only(), false).unwrap();
+
+        assert_eq!(after.summary.accepted, lint_errors);
+        assert_eq!(after.summary.errors, before.summary.errors - lint_errors);
+        // Still reported: a decision the reader cannot see is indistinguishable
+        // from a check that stopped running.
+        let waived: Vec<&Finding> = after
+            .findings
+            .iter()
+            .filter(|f| f.check == "lint" && f.term == "stray")
+            .collect();
+        assert_eq!(waived.len(), lint_errors);
+        assert!(waived.iter().all(|f| f.severity == waivers::ACCEPTED));
+        assert!(
+            waived[0]
+                .message
+                .contains("accepted 2026-09-20: a deliberate fixture")
+        );
+        assert!(to_text(&after).contains("accepted: "));
+        assert!(to_text(&after).contains(", 1 accepted"));
+    }
+
+    #[test]
+    fn waiving_every_error_makes_the_audit_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        let before = build(tmp.path(), structure_only(), false).unwrap();
+        assert!(!before.clean);
+        let entries: String = before
+            .findings
+            .iter()
+            .filter(|f| f.severity == "error")
+            .map(|f| {
+                format!(
+                    "\n[[audit.waiver]]\nterm = \"{}\"\ncheck = \"{}\"\nreason = \"fixture\"\ndecided_on = \"2026-09-20\"\n",
+                    f.term, f.check
+                )
+            })
+            .collect();
+        waiver_file(tmp.path(), &entries);
+        let after = build(tmp.path(), structure_only(), false).unwrap();
+        assert_eq!(after.summary.errors, 0);
+        assert!(after.clean, "an accepted error no longer blocks the audit");
+    }
+
+    #[test]
+    fn a_waiver_that_matches_nothing_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        waiver_file(
+            tmp.path(),
+            "\n[[audit.waiver]]\nterm = \"nosuchterm\"\ncheck = \"lint\"\nreason = \"stale\"\ndecided_on = \"2026-09-20\"\n",
+        );
+        let report = build(tmp.path(), structure_only(), false).unwrap();
+        let stale: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.check == "stale_waiver")
+            .collect();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].severity, "warning");
+        assert!(stale[0].message.contains("nosuchterm / lint"));
+    }
+
+    #[test]
+    fn a_waiver_missing_its_reason_fails_the_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        waiver_file(
+            tmp.path(),
+            "\n[[audit.waiver]]\nterm = \"stray\"\ncheck = \"lint\"\ndecided_on = \"2026-09-20\"\n",
+        );
+        // Same rule as audit.keep_unlinked: an exemption with no stated reason
+        // cannot be told apart from silencing the check.
+        let err = build(tmp.path(), structure_only(), false).unwrap_err();
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    #[test]
+    fn a_waiver_whose_reason_is_only_whitespace_fails_the_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        // toml is happy with this: `reason` is present and is a string. Only
+        // the validator can tell a stated reason from a placeholder, and a
+        // placeholder is how an exemption becomes a silenced check.
+        waiver_file(
+            tmp.path(),
+            "\n[[audit.waiver]]\nterm = \"stray\"\ncheck = \"lint\"\nreason = \"   \"\ndecided_on = \"2026-09-20\"\n",
+        );
+        let err = build(tmp.path(), structure_only(), false).unwrap_err();
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    #[test]
+    fn a_waiver_with_an_empty_term_or_check_fails_the_parse() {
+        for (field, body) in [
+            (
+                "term",
+                "\n[[audit.waiver]]\nterm = \"\"\ncheck = \"lint\"\nreason = \"r\"\ndecided_on = \"2026-09-20\"\n",
+            ),
+            (
+                "check",
+                "\n[[audit.waiver]]\nterm = \"stray\"\ncheck = \"\"\nreason = \"r\"\ndecided_on = \"2026-09-20\"\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            setup(tmp.path());
+            waiver_file(tmp.path(), body);
+            let err = build(tmp.path(), structure_only(), false).unwrap_err();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_waiver_with_an_unreadable_date_fails_the_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        waiver_file(
+            tmp.path(),
+            "\n[[audit.waiver]]\nterm = \"stray\"\ncheck = \"lint\"\nreason = \"r\"\ndecided_on = \"yesterday\"\n",
+        );
+        let err = build(tmp.path(), structure_only(), false).unwrap_err();
+        assert!(err.contains("decided_on"), "{err}");
+    }
+
+    #[test]
+    fn no_waivers_leaves_the_report_exactly_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path());
+        let report = build(tmp.path(), structure_only(), false).unwrap();
+        assert_eq!(report.summary.accepted, 0);
+        assert!(report.findings.iter().all(|f| f.check != "stale_waiver"));
+        assert!(!to_text(&report).contains("accepted"));
     }
 
     #[test]
@@ -973,7 +1167,7 @@ mod tests {
             json,
             serde_json::json!({
                 "ontology": "t", "classes": [], "findings": [],
-                "summary": {"errors": 0, "warnings": 0, "fixable": 0, "fixed": 0},
+                "summary": {"errors": 0, "warnings": 0, "accepted": 0, "fixable": 0, "fixed": 0},
                 "clean": true
             })
         );

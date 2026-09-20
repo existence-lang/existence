@@ -312,9 +312,45 @@ With no class flag the offline classes run; `--all` adds the network
 pass.
 
 Each finding carries `class`, `check`, `severity` (`error` fails the audit,
-`warning` never does), `term`, `message`, `fix` (the safe resolution, when
-one exists), and `fixed`. `--fix` applies only the mechanical resolutions;
-manifest membership, duplicates, and lint errors stay reported as decisions.
+`warning` never does, `accepted` is a decision already recorded), `term`,
+`message`, `fix` (the safe resolution, when one exists), and `fixed`. `--fix`
+applies only the mechanical resolutions; manifest membership, duplicates, and
+lint errors stay reported as decisions.
+
+#### Accepting a finding
+
+Some findings are not work waiting on anyone. A cited page that is gone from
+the live web, from the Wayback Machine and from every mirror is not going to
+come back, and the only question left — drop the citation, or keep it and live
+with the warning — is the author's, not the audit's. Record the decision and
+the finding stops counting:
+
+```toml
+[[audit.waiver]]
+term = "god"
+check = "unreachable_host"
+source = "theunboundedspirit.com"   # optional: narrows to one of a term's citations
+reason = "domain resold through a redirect chain; no archive copy exists"
+decided_on = "2026-09-20"
+```
+
+A matching finding still prints, now carrying the reason, but drops to
+severity `accepted`: counted as neither an error nor a warning, and no longer
+blocking a clean audit. It is deliberately not hidden — a decision the reader
+cannot see is indistinguishable from a check that quietly stopped running.
+
+`source` is matched as a substring of the finding's message, so either the URL
+or just the host works. `reason` has no default, for the same reason
+`keep_unlinked`'s does not. `decided_on` is required and must be `YYYY-MM-DD`:
+a structural decision stays true until someone edits the node, but a decision
+about somebody else's website is a claim about a world that keeps moving, so
+the record has to say when its evidence was last checked.
+
+A waiver is a decision about reporting, not about content: `--fix` still
+applies any safe resolution the finding carries. An entry that matches nothing
+is reported as `stale_waiver`, the way an unused keep is reported as
+`stale_keep` — a list nobody prunes is a way to silence the check rather than a
+record of decisions.
 
 ### Generate relationship graph
 
