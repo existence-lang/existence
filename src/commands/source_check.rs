@@ -101,6 +101,10 @@ struct Client {
     /// Snapshots whose own fetch failed, by raw snapshot URL. A snapshot that
     /// was never read cannot be said to lack a passage.
     pin_unreachable: BTreeMap<String, String>,
+    /// Snapshots the archive says do not exist, by raw snapshot URL. A subset
+    /// of `pin_unreachable`: these were answered, not missed, and the answer
+    /// will not change next week.
+    pin_gone: BTreeSet<String>,
     /// Normalised snapshot pages by raw snapshot URL, fetched once per run.
     pages: BTreeMap<String, Option<String>>,
     /// Candidate snapshot timestamps per page, in the order they are tried.
@@ -134,6 +138,7 @@ impl Client {
             last: None,
             unreachable: BTreeMap::new(),
             pin_unreachable: BTreeMap::new(),
+            pin_gone: BTreeSet::new(),
             pages: BTreeMap::new(),
             stamps: BTreeMap::new(),
             archive_hosts: [&opts.archive_web, &opts.cdx, &opts.wayback]
@@ -169,6 +174,9 @@ impl Client {
                 if outage_reason(&other).is_some() {
                     self.archive_unread.insert(raw.clone());
                 }
+                if gone_reason(&other).is_some() {
+                    self.pin_gone.insert(raw.clone());
+                }
                 self.pin_unreachable
                     .insert(raw.clone(), failure_reason(&other));
                 None
@@ -182,6 +190,14 @@ impl Client {
     /// A pin that was never read says nothing about the passage it holds.
     fn pin_fetch_failed(&self, archive: &str) -> Option<&String> {
         self.pin_unreachable.get(&raw_snapshot_url(archive))
+    }
+
+    /// Whether the archive answered that this snapshot does not exist. Such a
+    /// pin is not unread pending a better day: it is a citation of record that
+    /// is not coming back, and the only thing that resolves it is another
+    /// snapshot in its place.
+    fn pin_is_gone(&self, archive: &str) -> bool {
+        self.pin_gone.contains(&raw_snapshot_url(archive))
     }
 
     /// The snapshots of `url` in the order they are tried, from one CDX
@@ -330,10 +346,12 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                                 ),
                                 Some(format!("pin the archived copy {pin} beside the link")),
                             ));
+                            let retire = retired_pins(&client, &own);
                             to_write.push(PinWrite {
                                 term: term.clone(),
                                 url: url.clone(),
                                 pins: vec![pin],
+                                retire,
                             });
                         }
                         None => findings.push(source_finding(
@@ -435,10 +453,12 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                             ),
                             Some(format!("pin the archived copy {pins} beside the link")),
                         ));
+                        let retire = retired_pins(&client, &own);
                         to_write.push(PinWrite {
                             term: term.clone(),
                             url: url.clone(),
                             pins: needed,
+                            retire,
                         });
                     }
                     if let Some(first) = lost.first() {
@@ -456,14 +476,34 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                         // passage. That escalated an unreachable archive into
                         // an absent-quote error against a snapshot nobody had
                         // looked at.
-                        let unread: Vec<String> = known
-                            .iter()
-                            .filter_map(|p| {
-                                client.pin_fetch_failed(p).map(|why| format!("{p} ({why})"))
-                            })
-                            .collect();
+                        //
+                        // A pin the archive answered 404 for is the other case
+                        // and has to be split back out: it was not missed, it
+                        // is gone, and nothing about waiting another week will
+                        // change that. Reporting it as unread is what left a
+                        // dead pin warning every run with no resolution path,
+                        // which is the same shape as the bug above in reverse.
+                        let mut unread: Vec<String> = Vec::new();
+                        let mut gone: Vec<String> = Vec::new();
+                        for p in &known {
+                            let Some(why) = client.pin_fetch_failed(p) else {
+                                continue;
+                            };
+                            let named = format!("{p} ({why})");
+                            if client.pin_is_gone(p) {
+                                gone.push(named);
+                            } else {
+                                unread.push(named);
+                            }
+                        }
                         if unread.is_empty() {
-                            let message = if pins.is_empty() {
+                            let message = if !gone.is_empty() {
+                                format!(
+                                    "quoted passage is not on {url} and its pinned copy {} is gone from the archive; no snapshot of the page carries it: \u{201c}{}\u{201d}{more}",
+                                    gone.join(", "),
+                                    clip(first)
+                                )
+                            } else if pins.is_empty() {
                                 format!(
                                     "quoted passage no longer found on {url}: \u{201c}{}\u{201d}{more}",
                                     clip(first)
@@ -563,10 +603,12 @@ pub fn check(ontology_dir: &Path, opts: &SourceOptions, fix: bool) -> Result<Vec
                                 ),
                                 Some(format!("pin the archived copy {pins} beside the link")),
                             ));
+                            let retire = retired_pins(&client, &own);
                             to_write.push(PinWrite {
                                 term: term.clone(),
                                 url: url.clone(),
                                 pins: fresh,
+                                retire,
                             });
                         }
                         if let Some(quote) = adrift {
@@ -626,11 +668,16 @@ struct Verdict {
     status: Status,
 }
 
-/// Pins to write beside one node's anchor of `url`.
+/// Pins to write beside one node's anchor of `url`, and the pins already there
+/// that go when they are written.
 struct PinWrite {
     term: String,
     url: String,
     pins: Vec<String>,
+    /// Pins the archive says do not exist. A snapshot that 404s can never carry
+    /// the passage again, so writing its replacement retires it rather than
+    /// leaving a dead anchor beside a live one for someone to sort out later.
+    retire: Vec<String>,
 }
 
 /// Each quote against the live page.
@@ -791,17 +838,25 @@ fn apply_pin_fixes(
                 out.push_str(line);
                 continue;
             };
-            let cut = end_of_pins(line, at + close + "</a>".len(), &w.url);
+            let start = at + close + "</a>".len();
+            let cut = end_of_pins(line, start, &w.url);
             let missing: Vec<&String> = w
                 .pins
                 .iter()
                 .filter(|p| !line.contains(p.as_str()))
                 .collect();
+            // A pin is only ever retired alongside the replacement being
+            // written in its place, so there is nothing to do on a line that
+            // already carries every pin this write names: a gone pin with no
+            // replacement keeps its anchor deliberately, as the last thing
+            // left to look at.
             if missing.is_empty() {
                 out.push_str(line);
                 continue;
             }
-            out.push_str(&line[..cut]);
+            let kept = retain_pins(&line[start..cut], &w.retire);
+            out.push_str(&line[..start]);
+            out.push_str(&kept);
             for pin in missing {
                 let label = match snapshot_date(pin) {
                     Some(date) => format!("(archived {date})"),
@@ -835,6 +890,27 @@ fn apply_pin_fixes(
     Ok(())
 }
 
+/// The pin region with every retired pin's anchor dropped, and the rest kept
+/// exactly as written. Called on the span `end_of_pins` measured, which is a
+/// run of archive anchors and the whitespace between them.
+fn retain_pins(region: &str, retire: &[String]) -> String {
+    if retire.is_empty() {
+        return region.to_string();
+    }
+    let anchor = Regex::new(r#"^\s*<a\s+href="([^"\s]+)"[^>]*>[^<]*</a>"#).unwrap();
+    let mut out = String::with_capacity(region.len());
+    let mut rest = region;
+    while let Some(cap) = anchor.captures(rest) {
+        let end = cap.get(0).unwrap().end();
+        if !retire.iter().any(|p| p == &cap[1]) {
+            out.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The offset just past every archive anchor of `url` that follows `from`
 /// on the line, so a new pin lands after the ones already there.
 fn end_of_pins(line: &str, from: usize, url: &str) -> usize {
@@ -866,6 +942,17 @@ fn raw_snapshot_url(archive: &str) -> String {
     } else {
         re.replace(archive, "${1}id_/${2}").into_owned()
     }
+}
+
+/// The pins beside this anchor the archive says do not exist. Returned so that
+/// writing a replacement takes the dead one out at the same time: a 404
+/// snapshot cannot carry the passage next week either, and leaving it there
+/// costs a fetch every run and reads as a second citation of record.
+fn retired_pins(client: &Client, own: &[String]) -> Vec<String> {
+    own.iter()
+        .filter(|p| client.pin_is_gone(p))
+        .cloned()
+        .collect()
 }
 
 /// Search the archive for snapshots of `url` that carry the `lost` quotes.
@@ -1085,6 +1172,27 @@ fn outage_reason(out: &Fetch) -> Option<String> {
         Fetch::Response { status, .. } if retryable(*status) => Some(format!("HTTP {status}")),
         Fetch::Unreachable(reason) => Some(reason.clone()),
         Fetch::Response { .. } => None,
+    }
+}
+
+/// Whether a failed archive fetch means the thing is GONE rather than unread.
+///
+/// The archive answering `404` is an answer, and not one that changes next
+/// week: that snapshot does not exist. Treating it the same as an outage is
+/// what left a permanently dead pin warning every run with nothing to apply --
+/// the run keeps waiting for an archive that already replied.
+///
+/// A `403` is deliberately not gone. That is the Wayback Machine refusing to
+/// serve a domain it has excluded, and it refuses every other snapshot of the
+/// same page too, so there is nothing to re-pin to; waiting, and saying the pin
+/// was not read, is the honest report. A `5xx` or a dropped connection is
+/// "later" by the same reasoning as `outage_reason`.
+fn gone_reason(out: &Fetch) -> Option<String> {
+    match out {
+        Fetch::Response { status, .. } if *status == 404 || *status == 410 => {
+            Some(format!("HTTP {status}"))
+        }
+        _ => None,
     }
 }
 
@@ -1356,6 +1464,14 @@ mod tests {
                     // How an archive outage actually arrives: a response, not a
                     // dropped connection. archive.org answers its own downtime
                     // with this page.
+                    (
+                        503,
+                        "<html><head><title>Internet Archive: Temporarily Offline</title></head><body>back soon</body></html>".to_string(),
+                    )
+                } else if url.starts_with("/archive/19980101000000id_/") {
+                    // One snapshot the archive is merely unable to serve right
+                    // now, so a pin on it must keep waiting rather than be
+                    // replaced.
                     (
                         503,
                         "<html><head><title>Internet Archive: Temporarily Offline</title></head><body>back soon</body></html>".to_string(),
@@ -2067,6 +2183,132 @@ mod tests {
             findings
                 .iter()
                 .all(|f| f.check != "quote_missing" || f.term != "vault"),
+            "{findings:?}"
+        );
+    }
+
+    /// A pin the archive answers 404 for was not missed, it is gone: that
+    /// snapshot does not exist and will not next week either. Reporting it as
+    /// a pin nobody read left a permanently dead citation warning every run
+    /// with nothing anyone could apply, waiting on an archive that had already
+    /// replied. When no other snapshot carries the passage, the honest report
+    /// is the absent-quote error, which is an author's decision to make.
+    #[test]
+    fn a_pin_the_archive_says_is_gone_is_an_absent_quote_not_an_unread_pin() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/lostquote");
+        let gone_pin = format!("{base}/archive/19990101000000/{url}");
+        fs::write(
+            tmp.path().join("src/vault.md"),
+            pinned_node(
+                "Vault",
+                &url,
+                &gone_pin,
+                "A passage that vanished from the page.",
+            ),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "vault").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(
+            (mine[0].check.as_str(), mine[0].severity.as_str()),
+            ("quote_missing", "error"),
+            "a 404 pin is gone, not unread: {:?}",
+            mine[0]
+        );
+        assert!(
+            mine[0].message.contains("is gone from the archive"),
+            "{:?}",
+            mine[0]
+        );
+        assert!(mine[0].message.contains(&gone_pin), "{:?}", mine[0]);
+        // No replacement exists, so nothing is rewritten: dropping the only
+        // archived reference with nothing to put in its place would take away
+        // the one thing left to look at.
+        let vault = fs::read_to_string(tmp.path().join("src/vault.md")).unwrap();
+        assert!(vault.contains(&format!("href=\"{gone_pin}\"")), "{vault}");
+        // And a 404 candidate must not be counted as the archive being down.
+        assert!(
+            findings.iter().all(|f| f.check != "archive_unavailable"),
+            "{findings:?}"
+        );
+    }
+
+    /// The resolution path the warning never had: a pin that is gone and a
+    /// snapshot that carries the passage means `--fix` re-pins the anchor,
+    /// taking the dead pin out rather than leaving two citations of record.
+    #[test]
+    fn fix_repins_a_gone_pin_and_retires_it() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/drifted");
+        let gone_pin = format!("{base}/archive/19990101000000/{url}");
+        fs::write(
+            tmp.path().join("src/vault.md"),
+            pinned_node("Vault", &url, &gone_pin, DRIFTED),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let mine: Vec<&Finding> = findings.iter().filter(|f| f.term == "vault").collect();
+        assert_eq!(mine.len(), 1, "{findings:?}");
+        assert_eq!(mine[0].check, "quote_missing");
+        assert!(mine[0].fixed, "{:?}", mine[0]);
+        let fresh = format!("{base}/archive/20150301000000/{url}");
+        let vault = fs::read_to_string(tmp.path().join("src/vault.md")).unwrap();
+        assert!(
+            vault.contains(&format!(
+                "<a href=\"{url}\" target=\"_blank\">Vault (source)</a> <a href=\"{fresh}\" target=\"_blank\">(archived 2015-03-01)</a>\n"
+            )),
+            "{vault}"
+        );
+        assert!(
+            !vault.contains(&gone_pin),
+            "the dead pin stays behind: {vault}"
+        );
+
+        // Second run: the citation verifies against the new pin and the node
+        // has stopped reporting -- the treadmill is off, not just quieter.
+        let again = check(tmp.path(), &opts(&base, 10), false).unwrap();
+        assert!(again.iter().all(|f| f.term != "vault"), "{again:?}");
+    }
+
+    /// A pin the archive is merely unable to serve keeps waiting. Re-pinning
+    /// against an archive that is down would replace a good citation of record
+    /// on the strength of a bad week.
+    #[test]
+    fn a_pin_the_archive_cannot_serve_is_kept_when_a_replacement_is_written() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = serve(log.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), &base);
+        let url = format!("{base}/drifted");
+        let flaky = format!("{base}/archive/19980101000000/{url}");
+        fs::write(
+            tmp.path().join("src/vault.md"),
+            pinned_node("Vault", &url, &flaky, DRIFTED),
+        )
+        .unwrap();
+
+        let findings = check(tmp.path(), &opts(&base, 10), true).unwrap();
+        let vault = fs::read_to_string(tmp.path().join("src/vault.md")).unwrap();
+        let fresh = format!("{base}/archive/20150301000000/{url}");
+        assert!(vault.contains(&format!("href=\"{fresh}\"")), "{vault}");
+        assert!(
+            vault.contains(&format!("href=\"{flaky}\"")),
+            "a 503 pin must not be retired: {vault}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.term == "vault" && f.check == "quote_missing"),
             "{findings:?}"
         );
     }
